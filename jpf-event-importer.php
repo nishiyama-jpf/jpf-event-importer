@@ -217,8 +217,19 @@ function jpf_run_track_usage_close_job() {
     $today = wp_date( 'Y-m-d', $current_timestamp );
     $trigger_timestamp = strtotime( $today . ' ' . $trigger_time . ':00' );
 
+    jpf_add_close_log( 'info', '締切自動化ジョブを開始しました。', array(
+        'date'         => $today,
+        'current_time' => wp_date( 'H:i:s', $current_timestamp ),
+        'trigger_time' => $trigger_time,
+    ) );
+
     // 指定時刻を過ぎるまでは何もしない（過ぎたら次回Cron以降で実行）
     if ( ! $trigger_timestamp || $current_timestamp < $trigger_timestamp ) {
+        jpf_add_close_log( 'info', '指定時刻前のため処理をスキップしました。', array(
+            'date'         => $today,
+            'current_time' => wp_date( 'H:i:s', $current_timestamp ),
+            'trigger_time' => $trigger_time,
+        ) );
         return;
     }
 
@@ -423,6 +434,11 @@ function jpf_event_csv_importer_page() {
     if ( isset( $_POST['clear_close_logs'] ) && check_admin_referer( 'jpf_close_logs_nonce' ) ) {
         update_option( JPF_CLOSE_LOG_OPTION, array(), false );
         $message .= "<div class='updated'><p>締切自動化ログをクリアしました。</p></div>";
+    }
+
+    if ( isset( $_POST['run_close_job_now'] ) && check_admin_referer( 'jpf_close_job_run_nonce' ) ) {
+        jpf_run_track_usage_close_job();
+        $message .= "<div class='updated'><p>締切自動化ジョブを手動実行しました。最新ログを確認してください。</p></div>";
     }
 
     if ( isset( $_POST['submit_csv'] ) && check_admin_referer( 'jpf_csv_import_nonce' ) ) {
@@ -655,6 +671,11 @@ function jpf_event_csv_importer_page() {
         <form method="post" style="margin-bottom: 12px;">
             <?php wp_nonce_field( 'jpf_close_logs_nonce' ); ?>
             <?php submit_button( 'ログをクリア', 'delete', 'clear_close_logs', false ); ?>
+        </form>
+
+        <form method="post" style="margin-bottom: 12px;">
+            <?php wp_nonce_field( 'jpf_close_job_run_nonce' ); ?>
+            <?php submit_button( '締切自動化ジョブをいま実行', 'secondary', 'run_close_job_now', false ); ?>
         </form>
 
         <?php if ( empty( $close_logs ) ) : ?>

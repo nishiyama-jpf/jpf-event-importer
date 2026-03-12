@@ -11,10 +11,13 @@ if ( ! defined( 'ABSPATH' ) ) exit;
 
 const JPF_CLOSE_SETTINGS_OPTION = 'jpf_track_close_settings';
 const JPF_CLOSE_CRON_HOOK = 'jpf_track_usage_close_event';
+const JPF_CLOSE_CRON_RECURRENCE = 'jpf_every_five_minutes';
+const JPF_CLOSE_LOG_OPTION = 'jpf_track_close_logs';
 
 register_activation_hook( __FILE__, 'jpf_event_csv_importer_activate' );
 register_deactivation_hook( __FILE__, 'jpf_event_csv_importer_deactivate' );
 add_action( JPF_CLOSE_CRON_HOOK, 'jpf_run_track_usage_close_job' );
+add_filter( 'cron_schedules', 'jpf_register_close_cron_schedule' );
 
 /**
  * 1. 管理画面にメニューを追加
@@ -31,10 +34,24 @@ function jpf_event_csv_importer_menu() {
     );
 }
 
-function jpf_event_csv_importer_activate() {
-    if ( ! wp_next_scheduled( JPF_CLOSE_CRON_HOOK ) ) {
-        wp_schedule_event( time() + MINUTE_IN_SECONDS * 5, 'hourly', JPF_CLOSE_CRON_HOOK );
+function jpf_register_close_cron_schedule( $schedules ) {
+    if ( ! isset( $schedules[ JPF_CLOSE_CRON_RECURRENCE ] ) ) {
+        $schedules[ JPF_CLOSE_CRON_RECURRENCE ] = array(
+            'interval' => 5 * MINUTE_IN_SECONDS,
+            'display'  => 'Every 5 Minutes (JPF)',
+        );
     }
+
+    return $schedules;
+}
+
+function jpf_event_csv_importer_activate() {
+    $timestamp = wp_next_scheduled( JPF_CLOSE_CRON_HOOK );
+    if ( $timestamp ) {
+        wp_unschedule_event( $timestamp, JPF_CLOSE_CRON_HOOK );
+    }
+
+    wp_schedule_event( time() + MINUTE_IN_SECONDS, JPF_CLOSE_CRON_RECURRENCE, JPF_CLOSE_CRON_HOOK );
 }
 
 function jpf_event_csv_importer_deactivate() {
@@ -52,6 +69,7 @@ function jpf_get_close_settings() {
         'replacement_title'       => '{date} 走路利用 受付終了',
         'replacement_content'     => '本日の走路利用受付は終了しました。\n\n{month}のお知らせ・リンクをこちらに記載してください。',
         'replacement_list_text'   => '受付終了',
+        'replacement_rules'       => '',
         'delete_permanently'      => 0,
     );
 
@@ -77,19 +95,102 @@ function jpf_render_template_tokens( $text, $today ) {
     return strtr( (string) $text, $replacements );
 }
 
+function jpf_find_category_by_slug( $slug ) {
+    $slug = trim( (string) $slug );
+    if ( $slug === '' ) {
+        return false;
+    }
+
+    $candidates = array_unique( array_filter( array(
+        $slug,
+        sanitize_title( $slug ),
+        urldecode( $slug ),
+    ) ) );
+
+    foreach ( $candidates as $candidate ) {
+        $term = get_term_by( 'slug', $candidate, 'category' );
+        if ( $term && ! is_wp_error( $term ) ) {
+            return $term;
+        }
+    }
+
+    return false;
+}
+
 
 function jpf_parse_category_term_ids( $raw_slugs ) {
     $slugs = array_filter( array_map( 'trim', explode( ',', (string) $raw_slugs ) ) );
     $term_ids = array();
 
     foreach ( $slugs as $slug ) {
-        $term = get_term_by( 'slug', sanitize_title( $slug ), 'category' );
+        $term = jpf_find_category_by_slug( $slug );
         if ( $term && ! is_wp_error( $term ) ) {
             $term_ids[] = (int) $term->term_id;
         }
     }
 
     return array_values( array_unique( $term_ids ) );
+}
+
+function jpf_parse_replacement_rules( $raw_rules ) {
+    $rules = array();
+    $lines = preg_split( '/\r\n|\r|\n/', (string) $raw_rules );
+
+    foreach ( $lines as $line ) {
+        $line = trim( $line );
+        if ( $line === '' || strpos( $line, '#' ) === 0 ) {
+            continue;
+        }
+
+        $parts = array_map( 'trim', explode( '|', $line ) );
+        if ( empty( $parts[0] ) ) {
+            continue;
+        }
+
+        $target_term = jpf_find_category_by_slug( $parts[0] );
+        if ( ! $target_term ) {
+            continue;
+        }
+
+        $rules[ (int) $target_term->term_id ] = array(
+            'replacement_category'  => isset( $parts[1] ) ? $parts[1] : '',
+            'replacement_title'     => isset( $parts[2] ) ? $parts[2] : '',
+            'replacement_content'   => isset( $parts[3] ) ? $parts[3] : '',
+            'replacement_list_text' => isset( $parts[4] ) ? $parts[4] : '',
+        );
+    }
+
+    return $rules;
+}
+
+
+function jpf_add_close_job_log( $level, $message, $context = array() ) {
+    $logs = get_option( JPF_CLOSE_LOG_OPTION, array() );
+    if ( ! is_array( $logs ) ) {
+        $logs = array();
+    }
+
+    $logs[] = array(
+        'timestamp' => current_time( 'mysql' ),
+        'level'     => sanitize_key( $level ),
+        'message'   => sanitize_text_field( $message ),
+        'context'   => is_array( $context ) ? $context : array(),
+    );
+
+    if ( count( $logs ) > 100 ) {
+        $logs = array_slice( $logs, -100 );
+    }
+
+    update_option( JPF_CLOSE_LOG_OPTION, $logs );
+}
+
+function jpf_get_close_job_logs() {
+    $logs = get_option( JPF_CLOSE_LOG_OPTION, array() );
+    return is_array( $logs ) ? $logs : array();
+}
+
+function jpf_clear_close_job_logs() {
+    delete_option( JPF_CLOSE_LOG_OPTION );
 }
 
 function jpf_generate_event_key( $raw_date, $meta_start, $cat_slug, $title ) {
@@ -106,21 +207,30 @@ function jpf_generate_event_key( $raw_date, $meta_start, $cat_slug, $title ) {
 function jpf_run_track_usage_close_job() {
     $settings = jpf_get_close_settings();
 
-    $trigger_time = isset( $settings['trigger_time'] ) ? $settings['trigger_time'] : '23:55';
-    $current_time = wp_date( 'H:i', current_time( 'timestamp' ) );
-
-    // 時間一致時のみ動かす（hourlyイベントを時間ゲートで利用）
-    if ( $current_time !== $trigger_time ) {
+    $trigger_time = isset( $settings['trigger_time'] ) ? (string) $settings['trigger_time'] : '23:55';
+    if ( ! preg_match( '/^\d{2}:\d{2}$/', $trigger_time ) ) {
+        jpf_add_close_job_log( 'error', 'trigger_timeの形式が不正なため処理を中断しました。', array( 'trigger_time' => $trigger_time ) );
         return;
     }
+
+    $current_timestamp = current_time( 'timestamp' );
+    $today = wp_date( 'Y-m-d', $current_timestamp );
+    $trigger_timestamp = strtotime( $today . ' ' . $trigger_time . ':00' );
+
+    // 指定時刻を過ぎるまでは何もしない（過ぎたら次回Cron以降で実行）
+    if ( ! $trigger_timestamp || $current_timestamp < $trigger_timestamp ) {
+        return;
+    }
+
+    jpf_add_close_job_log( 'info', '締切自動化ジョブを開始しました。', array( 'today' => $today, 'trigger_time' => $trigger_time ) );
 
     $target_category_slugs = isset( $settings['target_category_slugs'] ) ? $settings['target_category_slugs'] : '';
     $target_term_ids = jpf_parse_category_term_ids( $target_category_slugs );
     if ( empty( $target_term_ids ) ) {
+        jpf_add_close_job_log( 'warning', '削除対象カテゴリが見つからないため終了しました。', array( 'target_category_slugs' => $target_category_slugs ) );
         return;
     }
 
-    $today = wp_date( 'Y-m-d', current_time( 'timestamp' ) );
 
     $target_post_ids = get_posts( array(
         'post_type'      => 'post',
@@ -142,57 +252,80 @@ function jpf_run_track_usage_close_job() {
         ),
     ) );
 
+    $matched_target_term_ids = array();
     $force_delete = ! empty( $settings['delete_permanently'] );
     foreach ( $target_post_ids as $post_id ) {
+        $post_term_ids = wp_get_post_terms( $post_id, 'category', array( 'fields' => 'ids' ) );
+        if ( ! is_wp_error( $post_term_ids ) ) {
+            $post_target_terms = array_intersect( $target_term_ids, array_map( 'intval', $post_term_ids ) );
+            $matched_target_term_ids = array_merge( $matched_target_term_ids, $post_target_terms );
+        }
         wp_delete_post( (int) $post_id, $force_delete );
     }
 
-    $closed_notice_key = 'jpf_closed_notice_' . $today;
-    $existing_closed = get_posts( array(
-        'post_type'      => 'post',
-        'post_status'    => array( 'publish', 'draft', 'pending', 'future', 'private', 'trash' ),
-        'posts_per_page' => 1,
-        'fields'         => 'ids',
-        'meta_query'     => array(
-            array(
-                'key'   => 'closed_notice_key',
-                'value' => $closed_notice_key,
+    $matched_target_term_ids = array_values( array_unique( array_map( 'intval', $matched_target_term_ids ) ) );
+    if ( empty( $matched_target_term_ids ) ) {
+        jpf_add_close_job_log( 'info', '当日の削除対象投稿が見つからなかったため終了しました。', array( 'today' => $today ) );
+        return;
+    }
+
+    jpf_add_close_job_log( 'info', '投稿削除を実行しました。', array( 'deleted_post_count' => count( $target_post_ids ), 'matched_target_term_ids' => $matched_target_term_ids ) );
+
+    $replacement_rules = jpf_parse_replacement_rules( isset( $settings['replacement_rules'] ) ? $settings['replacement_rules'] : '' );
+
+    foreach ( $matched_target_term_ids as $term_id ) {
+        $closed_notice_key = 'jpf_closed_notice_' . $today . '_' . $term_id;
+        $existing_closed = get_posts( array(
+            'post_type'      => 'post',
+            'post_status'    => array( 'publish', 'draft', 'pending', 'future', 'private', 'trash' ),
+            'posts_per_page' => 1,
+            'fields'         => 'ids',
+            'meta_query'     => array(
+                array(
+                    'key'   => 'closed_notice_key',
+                    'value' => $closed_notice_key,
+                ),
             ),
-        ),
-    ) );
+        ) );
 
-    if ( ! empty( $existing_closed ) ) {
-        return;
+        if ( ! empty( $existing_closed ) ) {
+            jpf_add_close_job_log( 'info', '既存の差し替え投稿があるためスキップしました。', array( 'term_id' => $term_id, 'closed_notice_key' => $closed_notice_key ) );
+            continue;
+        }
+
+        $rule = isset( $replacement_rules[ $term_id ] ) ? $replacement_rules[ $term_id ] : array();
+        $replacement_title = jpf_render_template_tokens( ! empty( $rule['replacement_title'] ) ? $rule['replacement_title'] : $settings['replacement_title'], $today );
+        $replacement_content = jpf_render_template_tokens( ! empty( $rule['replacement_content'] ) ? $rule['replacement_content'] : $settings['replacement_content'], $today );
+        $replacement_list_text = jpf_render_template_tokens( ! empty( $rule['replacement_list_text'] ) ? $rule['replacement_list_text'] : $settings['replacement_list_text'], $today );
+
+        $new_post_id = wp_insert_post( array(
+            'post_title'   => $replacement_title,
+            'post_content' => $replacement_content,
+            'post_status'  => 'publish',
+            'post_type'    => 'post',
+            'post_date'    => current_time( 'mysql' ),
+        ) );
+
+        if ( is_wp_error( $new_post_id ) ) {
+            jpf_add_close_job_log( 'error', '差し替え投稿の作成に失敗しました。', array( 'term_id' => $term_id, 'error' => $new_post_id->get_error_message() ) );
+            continue;
+        }
+
+        $replacement_slug = ! empty( $rule['replacement_category'] ) ? $rule['replacement_category'] : $settings['replacement_category'];
+        $replacement_term = jpf_find_category_by_slug( $replacement_slug );
+        if ( $replacement_term && ! is_wp_error( $replacement_term ) ) {
+            wp_set_object_terms( $new_post_id, (int) $replacement_term->term_id, 'category', false );
+        } else {
+            wp_set_object_terms( $new_post_id, $term_id, 'category', false );
+        }
+
+        update_post_meta( $new_post_id, '一覧表示用テキスト', $replacement_list_text );
+        update_post_meta( $new_post_id, 'event_date', $today );
+        update_post_meta( $new_post_id, 'is_track_usage', 1 );
+        update_post_meta( $new_post_id, 'closed_notice_key', $closed_notice_key );
+
+        jpf_add_close_job_log( 'info', '差し替え投稿を作成しました。', array( 'term_id' => $term_id, 'new_post_id' => $new_post_id, 'closed_notice_key' => $closed_notice_key ) );
     }
-
-    $replacement_title = jpf_render_template_tokens( $settings['replacement_title'], $today );
-    $replacement_content = jpf_render_template_tokens( $settings['replacement_content'], $today );
-    $replacement_list_text = jpf_render_template_tokens( $settings['replacement_list_text'], $today );
-
-    $new_post_id = wp_insert_post( array(
-        'post_title'   => $replacement_title,
-        'post_content' => $replacement_content,
-        'post_status'  => 'publish',
-        'post_type'    => 'post',
-        'post_date'    => current_time( 'mysql' ),
-    ) );
-
-    if ( is_wp_error( $new_post_id ) ) {
-        return;
-    }
-
-    $replacement_slug = isset( $settings['replacement_category'] ) ? sanitize_title( $settings['replacement_category'] ) : '';
-    $replacement_term = ! empty( $replacement_slug ) ? get_term_by( 'slug', $replacement_slug, 'category' ) : false;
-    if ( $replacement_term && ! is_wp_error( $replacement_term ) ) {
-        wp_set_object_terms( $new_post_id, (int) $replacement_term->term_id, 'category', false );
-    } else {
-        wp_set_object_terms( $new_post_id, $target_term_ids, 'category', false );
-    }
-
-    update_post_meta( $new_post_id, '一覧表示用テキスト', $replacement_list_text );
-    update_post_meta( $new_post_id, 'event_date', $today );
-    update_post_meta( $new_post_id, 'is_track_usage', 1 );
-    update_post_meta( $new_post_id, 'closed_notice_key', $closed_notice_key );
 }
 
 function jpf_update_meta_if_changed( $post_id, $meta_key, $new_value ) {
@@ -266,11 +399,17 @@ function jpf_event_csv_importer_page() {
             'replacement_title'     => isset( $_POST['replacement_title'] ) ? sanitize_text_field( wp_unslash( $_POST['replacement_title'] ) ) : '',
             'replacement_content'   => isset( $_POST['replacement_content'] ) ? wp_kses_post( wp_unslash( $_POST['replacement_content'] ) ) : '',
             'replacement_list_text' => isset( $_POST['replacement_list_text'] ) ? sanitize_text_field( wp_unslash( $_POST['replacement_list_text'] ) ) : '',
+            'replacement_rules'     => isset( $_POST['replacement_rules'] ) ? sanitize_textarea_field( wp_unslash( $_POST['replacement_rules'] ) ) : '',
             'delete_permanently'    => ! empty( $_POST['delete_permanently'] ) ? 1 : 0,
         );
 
         update_option( JPF_CLOSE_SETTINGS_OPTION, $settings );
         $message .= "<div class='updated'><p>締切自動化設定を保存しました。</p></div>";
+    }
+
+    if ( isset( $_POST['clear_close_logs'] ) && check_admin_referer( 'jpf_clear_close_logs_nonce' ) ) {
+        jpf_clear_close_job_logs();
+        $message .= "<div class='updated'><p>締切自動化ログをクリアしました。</p></div>";
     }
 
     if ( isset( $_POST['submit_csv'] ) && check_admin_referer( 'jpf_csv_import_nonce' ) ) {
@@ -342,7 +481,7 @@ function jpf_event_csv_importer_page() {
 
                 // カテゴリーの差し替え
                 if ( ! empty( $cat_slug ) ) {
-                    $term = get_term_by( 'slug', $cat_slug, 'category' );
+                    $term = jpf_find_category_by_slug( $cat_slug );
                     if ( $term && ! is_wp_error( $term ) ) {
                         $current_terms = wp_get_object_terms( $post_id, 'category', array( 'fields' => 'ids' ) );
                         $new_terms = array( (int) $term->term_id );
@@ -476,6 +615,14 @@ function jpf_event_csv_importer_page() {
                     <td><input type="text" name="replacement_list_text" id="replacement_list_text" class="regular-text" value="<?php echo esc_attr( $close_settings['replacement_list_text'] ); ?>"></td>
                 </tr>
                 <tr>
+                    <th scope="row"><label for="replacement_rules">カテゴリ別差し替えルール（任意）</label></th>
+                    <td>
+                        <textarea name="replacement_rules" id="replacement_rules" class="large-text code" rows="6"><?php echo esc_textarea( $close_settings['replacement_rules'] ); ?></textarea>
+                        <p class="description">1行に1ルール、<code>削除対象カテゴリ|差し替えカテゴリ|タイトル|本文|一覧表示用テキスト</code> の順で指定します。未指定項目は共通設定を利用します。</p>
+                        <p class="description">例: <code>track_group_open|track_group_open|{date} 受付終了|本日の受付は終了しました。|受付終了</code></p>
+                    </td>
+                </tr>
+                <tr>
                     <th scope="row">削除方式</th>
                     <td>
                         <label>
@@ -487,6 +634,39 @@ function jpf_event_csv_importer_page() {
             </table>
             <?php submit_button( '締切自動化設定を保存', 'secondary', 'save_close_settings' ); ?>
         </form>
+
+        <hr>
+
+        <h2>締切自動化ログ（最新100件）</h2>
+        <?php $close_logs = array_reverse( jpf_get_close_job_logs() ); ?>
+        <form method="post" style="margin-bottom:10px;">
+            <?php wp_nonce_field( 'jpf_clear_close_logs_nonce' ); ?>
+            <?php submit_button( 'ログをクリア', 'delete', 'clear_close_logs', false ); ?>
+        </form>
+        <?php if ( empty( $close_logs ) ) : ?>
+            <p>ログはまだありません。</p>
+        <?php else : ?>
+            <table class="widefat striped">
+                <thead>
+                    <tr>
+                        <th style="width:180px;">日時</th>
+                        <th style="width:100px;">レベル</th>
+                        <th>メッセージ</th>
+                        <th>詳細</th>
+                    </tr>
+                </thead>
+                <tbody>
+                <?php foreach ( $close_logs as $log ) : ?>
+                    <tr>
+                        <td><?php echo esc_html( isset( $log['timestamp'] ) ? $log['timestamp'] : '' ); ?></td>
+                        <td><?php echo esc_html( strtoupper( isset( $log['level'] ) ? $log['level'] : '' ) ); ?></td>
+                        <td><?php echo esc_html( isset( $log['message'] ) ? $log['message'] : '' ); ?></td>
+                        <td><code><?php echo esc_html( wp_json_encode( isset( $log['context'] ) ? $log['context'] : array(), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES ) ); ?></code></td>
+                    </tr>
+                <?php endforeach; ?>
+                </tbody>
+            </table>
+        <?php endif; ?>
     </div>
     <?php
 }

@@ -213,13 +213,17 @@ function jpf_run_track_usage_close_job() {
         return;
     }
 
-    $current_timestamp = current_time( 'timestamp' );
-    $today = wp_date( 'Y-m-d', $current_timestamp );
-    $trigger_timestamp = strtotime( $today . ' ' . $trigger_time . ':00' );
+    $timezone = wp_timezone();
+    $now = new DateTimeImmutable( 'now', $timezone );
+    $today = $now->format( 'Y-m-d' );
+    $current_timestamp = $now->getTimestamp();
+
+    $trigger_datetime = DateTimeImmutable::createFromFormat( 'Y-m-d H:i:s', $today . ' ' . $trigger_time . ':00', $timezone );
+    $trigger_timestamp = $trigger_datetime ? $trigger_datetime->getTimestamp() : false;
 
     jpf_add_close_log( 'info', '締切自動化ジョブを開始しました。', array(
         'date'         => $today,
-        'current_time' => wp_date( 'H:i:s', $current_timestamp ),
+        'current_time' => $now->format( 'H:i:s' ),
         'trigger_time' => $trigger_time,
     ) );
 
@@ -227,7 +231,7 @@ function jpf_run_track_usage_close_job() {
     if ( ! $trigger_timestamp || $current_timestamp < $trigger_timestamp ) {
         jpf_add_close_log( 'info', '指定時刻前のため処理をスキップしました。', array(
             'date'         => $today,
-            'current_time' => wp_date( 'H:i:s', $current_timestamp ),
+            'current_time' => $now->format( 'H:i:s' ),
             'trigger_time' => $trigger_time,
         ) );
         return;

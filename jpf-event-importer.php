@@ -52,6 +52,7 @@ function jpf_get_close_settings() {
         'replacement_title'       => '{date} 走路利用 受付終了',
         'replacement_content'     => '本日の走路利用受付は終了しました。\n\n{month}のお知らせ・リンクをこちらに記載してください。',
         'replacement_list_text'   => '受付終了',
+        'replacement_rules'       => '',
         'delete_permanently'      => 0,
     );
 
@@ -77,19 +78,72 @@ function jpf_render_template_tokens( $text, $today ) {
     return strtr( (string) $text, $replacements );
 }
 
+function jpf_find_category_by_slug( $slug ) {
+    $slug = trim( (string) $slug );
+    if ( $slug === '' ) {
+        return false;
+    }
+
+    $candidates = array_unique( array_filter( array(
+        $slug,
+        sanitize_title( $slug ),
+        urldecode( $slug ),
+    ) ) );
+
+    foreach ( $candidates as $candidate ) {
+        $term = get_term_by( 'slug', $candidate, 'category' );
+        if ( $term && ! is_wp_error( $term ) ) {
+            return $term;
+        }
+    }
+
+    return false;
+}
+
 
 function jpf_parse_category_term_ids( $raw_slugs ) {
     $slugs = array_filter( array_map( 'trim', explode( ',', (string) $raw_slugs ) ) );
     $term_ids = array();
 
     foreach ( $slugs as $slug ) {
-        $term = get_term_by( 'slug', sanitize_title( $slug ), 'category' );
+        $term = jpf_find_category_by_slug( $slug );
         if ( $term && ! is_wp_error( $term ) ) {
             $term_ids[] = (int) $term->term_id;
         }
     }
 
     return array_values( array_unique( $term_ids ) );
+}
+
+function jpf_parse_replacement_rules( $raw_rules ) {
+    $rules = array();
+    $lines = preg_split( '/\r\n|\r|\n/', (string) $raw_rules );
+
+    foreach ( $lines as $line ) {
+        $line = trim( $line );
+        if ( $line === '' || strpos( $line, '#' ) === 0 ) {
+            continue;
+        }
+
+        $parts = array_map( 'trim', explode( '|', $line ) );
+        if ( empty( $parts[0] ) ) {
+            continue;
+        }
+
+        $target_term = jpf_find_category_by_slug( $parts[0] );
+        if ( ! $target_term ) {
+            continue;
+        }
+
+        $rules[ (int) $target_term->term_id ] = array(
+            'replacement_category'  => isset( $parts[1] ) ? $parts[1] : '',
+            'replacement_title'     => isset( $parts[2] ) ? $parts[2] : '',
+            'replacement_content'   => isset( $parts[3] ) ? $parts[3] : '',
+            'replacement_list_text' => isset( $parts[4] ) ? $parts[4] : '',
+        );
+    }
+
+    return $rules;
 }
 
 function jpf_generate_event_key( $raw_date, $meta_start, $cat_slug, $title ) {
@@ -142,57 +196,73 @@ function jpf_run_track_usage_close_job() {
         ),
     ) );
 
+    $matched_target_term_ids = array();
     $force_delete = ! empty( $settings['delete_permanently'] );
     foreach ( $target_post_ids as $post_id ) {
+        $post_term_ids = wp_get_post_terms( $post_id, 'category', array( 'fields' => 'ids' ) );
+        if ( ! is_wp_error( $post_term_ids ) ) {
+            $post_target_terms = array_intersect( $target_term_ids, array_map( 'intval', $post_term_ids ) );
+            $matched_target_term_ids = array_merge( $matched_target_term_ids, $post_target_terms );
+        }
         wp_delete_post( (int) $post_id, $force_delete );
     }
 
-    $closed_notice_key = 'jpf_closed_notice_' . $today;
-    $existing_closed = get_posts( array(
-        'post_type'      => 'post',
-        'post_status'    => array( 'publish', 'draft', 'pending', 'future', 'private', 'trash' ),
-        'posts_per_page' => 1,
-        'fields'         => 'ids',
-        'meta_query'     => array(
-            array(
-                'key'   => 'closed_notice_key',
-                'value' => $closed_notice_key,
+    $matched_target_term_ids = array_values( array_unique( array_map( 'intval', $matched_target_term_ids ) ) );
+    if ( empty( $matched_target_term_ids ) ) {
+        return;
+    }
+
+    $replacement_rules = jpf_parse_replacement_rules( isset( $settings['replacement_rules'] ) ? $settings['replacement_rules'] : '' );
+
+    foreach ( $matched_target_term_ids as $term_id ) {
+        $closed_notice_key = 'jpf_closed_notice_' . $today . '_' . $term_id;
+        $existing_closed = get_posts( array(
+            'post_type'      => 'post',
+            'post_status'    => array( 'publish', 'draft', 'pending', 'future', 'private', 'trash' ),
+            'posts_per_page' => 1,
+            'fields'         => 'ids',
+            'meta_query'     => array(
+                array(
+                    'key'   => 'closed_notice_key',
+                    'value' => $closed_notice_key,
+                ),
             ),
-        ),
-    ) );
+        ) );
 
-    if ( ! empty( $existing_closed ) ) {
-        return;
+        if ( ! empty( $existing_closed ) ) {
+            continue;
+        }
+
+        $rule = isset( $replacement_rules[ $term_id ] ) ? $replacement_rules[ $term_id ] : array();
+        $replacement_title = jpf_render_template_tokens( ! empty( $rule['replacement_title'] ) ? $rule['replacement_title'] : $settings['replacement_title'], $today );
+        $replacement_content = jpf_render_template_tokens( ! empty( $rule['replacement_content'] ) ? $rule['replacement_content'] : $settings['replacement_content'], $today );
+        $replacement_list_text = jpf_render_template_tokens( ! empty( $rule['replacement_list_text'] ) ? $rule['replacement_list_text'] : $settings['replacement_list_text'], $today );
+
+        $new_post_id = wp_insert_post( array(
+            'post_title'   => $replacement_title,
+            'post_content' => $replacement_content,
+            'post_status'  => 'publish',
+            'post_type'    => 'post',
+            'post_date'    => current_time( 'mysql' ),
+        ) );
+
+        if ( is_wp_error( $new_post_id ) ) {
+            continue;
+        }
+
+        $replacement_slug = ! empty( $rule['replacement_category'] ) ? $rule['replacement_category'] : $settings['replacement_category'];
+        $replacement_term = jpf_find_category_by_slug( $replacement_slug );
+        if ( $replacement_term && ! is_wp_error( $replacement_term ) ) {
+            wp_set_object_terms( $new_post_id, (int) $replacement_term->term_id, 'category', false );
+        } else {
+            wp_set_object_terms( $new_post_id, $term_id, 'category', false );
+        }
+
+        update_post_meta( $new_post_id, '一覧表示用テキスト', $replacement_list_text );
+        update_post_meta( $new_post_id, 'event_date', $today );
+        update_post_meta( $new_post_id, 'is_track_usage', 1 );
+        update_post_meta( $new_post_id, 'closed_notice_key', $closed_notice_key );
     }
-
-    $replacement_title = jpf_render_template_tokens( $settings['replacement_title'], $today );
-    $replacement_content = jpf_render_template_tokens( $settings['replacement_content'], $today );
-    $replacement_list_text = jpf_render_template_tokens( $settings['replacement_list_text'], $today );
-
-    $new_post_id = wp_insert_post( array(
-        'post_title'   => $replacement_title,
-        'post_content' => $replacement_content,
-        'post_status'  => 'publish',
-        'post_type'    => 'post',
-        'post_date'    => current_time( 'mysql' ),
-    ) );
-
-    if ( is_wp_error( $new_post_id ) ) {
-        return;
-    }
-
-    $replacement_slug = isset( $settings['replacement_category'] ) ? sanitize_title( $settings['replacement_category'] ) : '';
-    $replacement_term = ! empty( $replacement_slug ) ? get_term_by( 'slug', $replacement_slug, 'category' ) : false;
-    if ( $replacement_term && ! is_wp_error( $replacement_term ) ) {
-        wp_set_object_terms( $new_post_id, (int) $replacement_term->term_id, 'category', false );
-    } else {
-        wp_set_object_terms( $new_post_id, $target_term_ids, 'category', false );
-    }
-
-    update_post_meta( $new_post_id, '一覧表示用テキスト', $replacement_list_text );
-    update_post_meta( $new_post_id, 'event_date', $today );
-    update_post_meta( $new_post_id, 'is_track_usage', 1 );
-    update_post_meta( $new_post_id, 'closed_notice_key', $closed_notice_key );
 }
 
 function jpf_update_meta_if_changed( $post_id, $meta_key, $new_value ) {
@@ -266,6 +336,7 @@ function jpf_event_csv_importer_page() {
             'replacement_title'     => isset( $_POST['replacement_title'] ) ? sanitize_text_field( wp_unslash( $_POST['replacement_title'] ) ) : '',
             'replacement_content'   => isset( $_POST['replacement_content'] ) ? wp_kses_post( wp_unslash( $_POST['replacement_content'] ) ) : '',
             'replacement_list_text' => isset( $_POST['replacement_list_text'] ) ? sanitize_text_field( wp_unslash( $_POST['replacement_list_text'] ) ) : '',
+            'replacement_rules'     => isset( $_POST['replacement_rules'] ) ? sanitize_textarea_field( wp_unslash( $_POST['replacement_rules'] ) ) : '',
             'delete_permanently'    => ! empty( $_POST['delete_permanently'] ) ? 1 : 0,
         );
 
@@ -342,7 +413,7 @@ function jpf_event_csv_importer_page() {
 
                 // カテゴリーの差し替え
                 if ( ! empty( $cat_slug ) ) {
-                    $term = get_term_by( 'slug', $cat_slug, 'category' );
+                    $term = jpf_find_category_by_slug( $cat_slug );
                     if ( $term && ! is_wp_error( $term ) ) {
                         $current_terms = wp_get_object_terms( $post_id, 'category', array( 'fields' => 'ids' ) );
                         $new_terms = array( (int) $term->term_id );
@@ -474,6 +545,14 @@ function jpf_event_csv_importer_page() {
                 <tr>
                     <th scope="row"><label for="replacement_list_text">差し替え一覧表示用テキスト</label></th>
                     <td><input type="text" name="replacement_list_text" id="replacement_list_text" class="regular-text" value="<?php echo esc_attr( $close_settings['replacement_list_text'] ); ?>"></td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="replacement_rules">カテゴリ別差し替えルール（任意）</label></th>
+                    <td>
+                        <textarea name="replacement_rules" id="replacement_rules" class="large-text code" rows="6"><?php echo esc_textarea( $close_settings['replacement_rules'] ); ?></textarea>
+                        <p class="description">1行に1ルール、<code>削除対象カテゴリ|差し替えカテゴリ|タイトル|本文|一覧表示用テキスト</code> の順で指定します。未指定項目は共通設定を利用します。</p>
+                        <p class="description">例: <code>track_group_open|track_group_open|{date} 受付終了|本日の受付は終了しました。|受付終了</code></p>
+                    </td>
                 </tr>
                 <tr>
                     <th scope="row">削除方式</th>

@@ -12,6 +12,8 @@ if ( ! defined( 'ABSPATH' ) ) exit;
 const JPF_CLOSE_SETTINGS_OPTION = 'jpf_track_close_settings';
 const JPF_CLOSE_CRON_HOOK = 'jpf_track_usage_close_event';
 const JPF_CLOSE_CRON_RECURRENCE = 'jpf_every_five_minutes';
+const JPF_CLOSE_LOG_OPTION = 'jpf_track_close_logs';
+const JPF_CLOSE_LOG_LIMIT = 100;
 
 register_activation_hook( __FILE__, 'jpf_event_csv_importer_activate' );
 register_deactivation_hook( __FILE__, 'jpf_event_csv_importer_deactivate' );
@@ -58,6 +60,35 @@ function jpf_event_csv_importer_deactivate() {
     if ( $timestamp ) {
         wp_unschedule_event( $timestamp, JPF_CLOSE_CRON_HOOK );
     }
+}
+
+function jpf_add_close_log( $level, $message, $context = array() ) {
+    $logs = get_option( JPF_CLOSE_LOG_OPTION, array() );
+    if ( ! is_array( $logs ) ) {
+        $logs = array();
+    }
+
+    $logs[] = array(
+        'time'    => current_time( 'mysql' ),
+        'level'   => sanitize_key( (string) $level ),
+        'message' => sanitize_text_field( (string) $message ),
+        'context' => is_array( $context ) ? $context : array(),
+    );
+
+    if ( count( $logs ) > JPF_CLOSE_LOG_LIMIT ) {
+        $logs = array_slice( $logs, -JPF_CLOSE_LOG_LIMIT );
+    }
+
+    update_option( JPF_CLOSE_LOG_OPTION, $logs, false );
+}
+
+function jpf_get_close_logs() {
+    $logs = get_option( JPF_CLOSE_LOG_OPTION, array() );
+    if ( ! is_array( $logs ) ) {
+        return array();
+    }
+
+    return array_reverse( $logs );
 }
 
 function jpf_get_close_settings() {
@@ -178,6 +209,7 @@ function jpf_run_track_usage_close_job() {
 
     $trigger_time = isset( $settings['trigger_time'] ) ? (string) $settings['trigger_time'] : '23:55';
     if ( ! preg_match( '/^\d{2}:\d{2}$/', $trigger_time ) ) {
+        jpf_add_close_log( 'error', '自動削除をスキップ: 実行時刻の形式が不正です。', array( 'trigger_time' => $trigger_time ) );
         return;
     }
 
@@ -193,6 +225,7 @@ function jpf_run_track_usage_close_job() {
     $target_category_slugs = isset( $settings['target_category_slugs'] ) ? $settings['target_category_slugs'] : '';
     $target_term_ids = jpf_parse_category_term_ids( $target_category_slugs );
     if ( empty( $target_term_ids ) ) {
+        jpf_add_close_log( 'error', '自動削除をスキップ: 削除対象カテゴリが見つかりません。', array( 'target_category_slugs' => $target_category_slugs ) );
         return;
     }
 
@@ -228,8 +261,15 @@ function jpf_run_track_usage_close_job() {
         wp_delete_post( (int) $post_id, $force_delete );
     }
 
+    jpf_add_close_log( 'info', '対象投稿の削除処理を実行しました。', array(
+        'date'          => $today,
+        'deleted_count' => count( $target_post_ids ),
+        'force_delete'  => (int) $force_delete,
+    ) );
+
     $matched_target_term_ids = array_values( array_unique( array_map( 'intval', $matched_target_term_ids ) ) );
     if ( empty( $matched_target_term_ids ) ) {
+        jpf_add_close_log( 'info', '削除対象はありましたが、差し替え作成対象カテゴリはありませんでした。', array( 'date' => $today ) );
         return;
     }
 
@@ -251,6 +291,10 @@ function jpf_run_track_usage_close_job() {
         ) );
 
         if ( ! empty( $existing_closed ) ) {
+            jpf_add_close_log( 'info', '差し替え投稿は既に存在するためスキップしました。', array(
+                'date'    => $today,
+                'term_id' => $term_id,
+            ) );
             continue;
         }
 
@@ -268,6 +312,11 @@ function jpf_run_track_usage_close_job() {
         ) );
 
         if ( is_wp_error( $new_post_id ) ) {
+            jpf_add_close_log( 'error', '差し替え投稿の作成に失敗しました。', array(
+                'date'    => $today,
+                'term_id' => $term_id,
+                'error'   => $new_post_id->get_error_message(),
+            ) );
             continue;
         }
 
@@ -283,6 +332,12 @@ function jpf_run_track_usage_close_job() {
         update_post_meta( $new_post_id, 'event_date', $today );
         update_post_meta( $new_post_id, 'is_track_usage', 1 );
         update_post_meta( $new_post_id, 'closed_notice_key', $closed_notice_key );
+
+        jpf_add_close_log( 'info', '差し替え投稿を作成しました。', array(
+            'date'        => $today,
+            'term_id'     => $term_id,
+            'new_post_id' => (int) $new_post_id,
+        ) );
     }
 }
 
@@ -363,6 +418,11 @@ function jpf_event_csv_importer_page() {
 
         update_option( JPF_CLOSE_SETTINGS_OPTION, $settings );
         $message .= "<div class='updated'><p>締切自動化設定を保存しました。</p></div>";
+    }
+
+    if ( isset( $_POST['clear_close_logs'] ) && check_admin_referer( 'jpf_close_logs_nonce' ) ) {
+        update_option( JPF_CLOSE_LOG_OPTION, array(), false );
+        $message .= "<div class='updated'><p>締切自動化ログをクリアしました。</p></div>";
     }
 
     if ( isset( $_POST['submit_csv'] ) && check_admin_referer( 'jpf_csv_import_nonce' ) ) {
@@ -499,6 +559,7 @@ function jpf_event_csv_importer_page() {
     }
 
     $close_settings = jpf_get_close_settings();
+    $close_logs = jpf_get_close_logs();
 
     // 画面のHTML出力
     ?>
@@ -587,6 +648,39 @@ function jpf_event_csv_importer_page() {
             </table>
             <?php submit_button( '締切自動化設定を保存', 'secondary', 'save_close_settings' ); ?>
         </form>
+
+        <h2>締切自動化ログ（最新<?php echo esc_html( JPF_CLOSE_LOG_LIMIT ); ?>件）</h2>
+        <p>サーバーログを確認できない場合でも、この画面で自動削除処理の結果を確認できます。</p>
+
+        <form method="post" style="margin-bottom: 12px;">
+            <?php wp_nonce_field( 'jpf_close_logs_nonce' ); ?>
+            <?php submit_button( 'ログをクリア', 'delete', 'clear_close_logs', false ); ?>
+        </form>
+
+        <?php if ( empty( $close_logs ) ) : ?>
+            <p>ログはまだありません。</p>
+        <?php else : ?>
+            <table class="widefat striped">
+                <thead>
+                    <tr>
+                        <th style="width: 180px;">時刻</th>
+                        <th style="width: 100px;">レベル</th>
+                        <th>内容</th>
+                        <th>詳細</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php foreach ( $close_logs as $log ) : ?>
+                        <tr>
+                            <td><?php echo esc_html( isset( $log['time'] ) ? $log['time'] : '' ); ?></td>
+                            <td><code><?php echo esc_html( isset( $log['level'] ) ? strtoupper( $log['level'] ) : '' ); ?></code></td>
+                            <td><?php echo esc_html( isset( $log['message'] ) ? $log['message'] : '' ); ?></td>
+                            <td><code><?php echo esc_html( wp_json_encode( isset( $log['context'] ) ? $log['context'] : array(), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES ) ); ?></code></td>
+                        </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+        <?php endif; ?>
     </div>
     <?php
 }

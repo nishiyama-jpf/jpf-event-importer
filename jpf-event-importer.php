@@ -1,13 +1,20 @@
 <?php
 /*
 Plugin Name: JPF イベント一括登録プラグイン
-Description: CSVファイルからイベント（投稿）、ACF、およびアイキャッチ画像を一括で新規登録します。
-Version: 1.5
+Description: CSVファイルからイベント（投稿）、ACF、およびアイキャッチ画像を一括で登録・更新します。
+Version: 1.6
 Author: プロのWordPressエンジニア
 */
 
 // 直接アクセスを禁止
 if ( ! defined( 'ABSPATH' ) ) exit;
+
+const JPF_CLOSE_SETTINGS_OPTION = 'jpf_track_close_settings';
+const JPF_CLOSE_CRON_HOOK = 'jpf_track_usage_close_event';
+
+register_activation_hook( __FILE__, 'jpf_event_csv_importer_activate' );
+register_deactivation_hook( __FILE__, 'jpf_event_csv_importer_deactivate' );
+add_action( JPF_CLOSE_CRON_HOOK, 'jpf_run_track_usage_close_job' );
 
 /**
  * 1. 管理画面にメニューを追加
@@ -24,48 +31,292 @@ function jpf_event_csv_importer_menu() {
     );
 }
 
+function jpf_event_csv_importer_activate() {
+    if ( ! wp_next_scheduled( JPF_CLOSE_CRON_HOOK ) ) {
+        wp_schedule_event( time() + MINUTE_IN_SECONDS * 5, 'hourly', JPF_CLOSE_CRON_HOOK );
+    }
+}
+
+function jpf_event_csv_importer_deactivate() {
+    $timestamp = wp_next_scheduled( JPF_CLOSE_CRON_HOOK );
+    if ( $timestamp ) {
+        wp_unschedule_event( $timestamp, JPF_CLOSE_CRON_HOOK );
+    }
+}
+
+function jpf_get_close_settings() {
+    $defaults = array(
+        'trigger_time'            => '23:55',
+        'target_category_slugs'   => 'track_group_open',
+        'replacement_category'    => 'track_group_open',
+        'replacement_title'       => '{date} 走路利用 受付終了',
+        'replacement_content'     => '本日の走路利用受付は終了しました。\n\n{month}のお知らせ・リンクをこちらに記載してください。',
+        'replacement_list_text'   => '受付終了',
+        'delete_permanently'      => 0,
+    );
+
+    $saved = get_option( JPF_CLOSE_SETTINGS_OPTION, array() );
+    if ( ! is_array( $saved ) ) {
+        $saved = array();
+    }
+
+
+    if ( empty( $saved['target_category_slugs'] ) && ! empty( $saved['target_category_slug'] ) ) {
+        $saved['target_category_slugs'] = sanitize_text_field( $saved['target_category_slug'] );
+    }
+
+    return wp_parse_args( $saved, $defaults );
+}
+
+function jpf_render_template_tokens( $text, $today ) {
+    $replacements = array(
+        '{date}'  => $today,
+        '{month}' => wp_date( 'Y年n月', strtotime( $today ) ),
+    );
+
+    return strtr( (string) $text, $replacements );
+}
+
+
+function jpf_parse_category_term_ids( $raw_slugs ) {
+    $slugs = array_filter( array_map( 'trim', explode( ',', (string) $raw_slugs ) ) );
+    $term_ids = array();
+
+    foreach ( $slugs as $slug ) {
+        $term = get_term_by( 'slug', sanitize_title( $slug ), 'category' );
+        if ( $term && ! is_wp_error( $term ) ) {
+            $term_ids[] = (int) $term->term_id;
+        }
+    }
+
+    return array_values( array_unique( $term_ids ) );
+}
+
+function jpf_generate_event_key( $raw_date, $meta_start, $cat_slug, $title ) {
+    $base = implode( '|', array(
+        (string) $raw_date,
+        (string) $meta_start,
+        (string) $cat_slug,
+        (string) $title,
+    ) );
+
+    return 'jpf_' . md5( $base );
+}
+
+function jpf_run_track_usage_close_job() {
+    $settings = jpf_get_close_settings();
+
+    $trigger_time = isset( $settings['trigger_time'] ) ? $settings['trigger_time'] : '23:55';
+    $current_time = wp_date( 'H:i', current_time( 'timestamp' ) );
+
+    // 時間一致時のみ動かす（hourlyイベントを時間ゲートで利用）
+    if ( $current_time !== $trigger_time ) {
+        return;
+    }
+
+    $target_category_slugs = isset( $settings['target_category_slugs'] ) ? $settings['target_category_slugs'] : '';
+    $target_term_ids = jpf_parse_category_term_ids( $target_category_slugs );
+    if ( empty( $target_term_ids ) ) {
+        return;
+    }
+
+    $today = wp_date( 'Y-m-d', current_time( 'timestamp' ) );
+
+    $target_post_ids = get_posts( array(
+        'post_type'      => 'post',
+        'post_status'    => 'publish',
+        'fields'         => 'ids',
+        'posts_per_page' => -1,
+        'tax_query'      => array(
+            array(
+                'taxonomy' => 'category',
+                'field'    => 'term_id',
+                'terms'    => $target_term_ids,
+            ),
+        ),
+        'meta_query'     => array(
+            array(
+                'key'   => 'event_date',
+                'value' => $today,
+            ),
+        ),
+    ) );
+
+    $force_delete = ! empty( $settings['delete_permanently'] );
+    foreach ( $target_post_ids as $post_id ) {
+        wp_delete_post( (int) $post_id, $force_delete );
+    }
+
+    $closed_notice_key = 'jpf_closed_notice_' . $today;
+    $existing_closed = get_posts( array(
+        'post_type'      => 'post',
+        'post_status'    => array( 'publish', 'draft', 'pending', 'future', 'private', 'trash' ),
+        'posts_per_page' => 1,
+        'fields'         => 'ids',
+        'meta_query'     => array(
+            array(
+                'key'   => 'closed_notice_key',
+                'value' => $closed_notice_key,
+            ),
+        ),
+    ) );
+
+    if ( ! empty( $existing_closed ) ) {
+        return;
+    }
+
+    $replacement_title = jpf_render_template_tokens( $settings['replacement_title'], $today );
+    $replacement_content = jpf_render_template_tokens( $settings['replacement_content'], $today );
+    $replacement_list_text = jpf_render_template_tokens( $settings['replacement_list_text'], $today );
+
+    $new_post_id = wp_insert_post( array(
+        'post_title'   => $replacement_title,
+        'post_content' => $replacement_content,
+        'post_status'  => 'publish',
+        'post_type'    => 'post',
+        'post_date'    => current_time( 'mysql' ),
+    ) );
+
+    if ( is_wp_error( $new_post_id ) ) {
+        return;
+    }
+
+    $replacement_slug = isset( $settings['replacement_category'] ) ? sanitize_title( $settings['replacement_category'] ) : '';
+    $replacement_term = ! empty( $replacement_slug ) ? get_term_by( 'slug', $replacement_slug, 'category' ) : false;
+    if ( $replacement_term && ! is_wp_error( $replacement_term ) ) {
+        wp_set_object_terms( $new_post_id, (int) $replacement_term->term_id, 'category', false );
+    } else {
+        wp_set_object_terms( $new_post_id, $target_term_ids, 'category', false );
+    }
+
+    update_post_meta( $new_post_id, '一覧表示用テキスト', $replacement_list_text );
+    update_post_meta( $new_post_id, 'event_date', $today );
+    update_post_meta( $new_post_id, 'is_track_usage', 1 );
+    update_post_meta( $new_post_id, 'closed_notice_key', $closed_notice_key );
+}
+
+function jpf_update_meta_if_changed( $post_id, $meta_key, $new_value ) {
+    $current_value = get_post_meta( $post_id, $meta_key, true );
+    if ( (string) $current_value === (string) $new_value ) {
+        return false;
+    }
+
+    update_post_meta( $post_id, $meta_key, $new_value );
+    return true;
+}
+
+function jpf_find_existing_post_id( $event_key, $event_date, $meta_start ) {
+    if ( ! empty( $event_key ) ) {
+        $by_key = get_posts( array(
+            'post_type'      => 'post',
+            'post_status'    => array( 'publish', 'draft', 'pending', 'future', 'private' ),
+            'posts_per_page' => 1,
+            'fields'         => 'ids',
+            'meta_query'     => array(
+                array(
+                    'key'   => 'event_key',
+                    'value' => $event_key,
+                ),
+            ),
+        ) );
+
+        if ( ! empty( $by_key ) ) {
+            return (int) $by_key[0];
+        }
+    }
+
+    if ( ! empty( $event_date ) && ! empty( $meta_start ) ) {
+        $by_slot = get_posts( array(
+            'post_type'      => 'post',
+            'post_status'    => array( 'publish', 'draft', 'pending', 'future', 'private' ),
+            'posts_per_page' => 1,
+            'fields'         => 'ids',
+            'meta_query'     => array(
+                'relation' => 'AND',
+                array(
+                    'key'   => 'event_date',
+                    'value' => $event_date,
+                ),
+                array(
+                    'key'   => 'start',
+                    'value' => $meta_start,
+                ),
+            ),
+        ) );
+
+        if ( ! empty( $by_slot ) ) {
+            return (int) $by_slot[0];
+        }
+    }
+
+    return 0;
+}
+
 /**
  * 2. 管理画面の描画とCSV処理ロジック
  */
 function jpf_event_csv_importer_page() {
     $message = '';
 
+    if ( isset( $_POST['save_close_settings'] ) && check_admin_referer( 'jpf_close_settings_nonce' ) ) {
+        $settings = array(
+            'trigger_time'          => isset( $_POST['trigger_time'] ) ? sanitize_text_field( wp_unslash( $_POST['trigger_time'] ) ) : '23:55',
+            'target_category_slugs' => isset( $_POST['target_category_slugs'] ) ? sanitize_text_field( wp_unslash( $_POST['target_category_slugs'] ) ) : '',
+            'replacement_category'  => isset( $_POST['replacement_category'] ) ? sanitize_title( wp_unslash( $_POST['replacement_category'] ) ) : '',
+            'replacement_title'     => isset( $_POST['replacement_title'] ) ? sanitize_text_field( wp_unslash( $_POST['replacement_title'] ) ) : '',
+            'replacement_content'   => isset( $_POST['replacement_content'] ) ? wp_kses_post( wp_unslash( $_POST['replacement_content'] ) ) : '',
+            'replacement_list_text' => isset( $_POST['replacement_list_text'] ) ? sanitize_text_field( wp_unslash( $_POST['replacement_list_text'] ) ) : '',
+            'delete_permanently'    => ! empty( $_POST['delete_permanently'] ) ? 1 : 0,
+        );
+
+        update_option( JPF_CLOSE_SETTINGS_OPTION, $settings );
+        $message .= "<div class='updated'><p>締切自動化設定を保存しました。</p></div>";
+    }
+
     if ( isset( $_POST['submit_csv'] ) && check_admin_referer( 'jpf_csv_import_nonce' ) ) {
         if ( ! empty( $_FILES['csv_file']['tmp_name'] ) ) {
             $file = $_FILES['csv_file']['tmp_name'];
-            $success_count = 0;
+            $created_count = 0;
+            $updated_count = 0;
             $error_count = 0;
             $inserted_links = array();
 
             $csv = new SplFileObject( $file );
             $csv->setFlags( SplFileObject::READ_CSV | SplFileObject::READ_AHEAD | SplFileObject::SKIP_EMPTY | SplFileObject::DROP_NEW_LINE );
-            
+
             foreach ( $csv as $index => $row ) {
                 if ( $index === 0 ) continue;
+                if ( empty( $row ) || ! is_array( $row ) ) continue;
 
-                // 11列のデータ取得（BOM除去含む）
-                $title        = isset($row[0]) ? preg_replace('/^\xEF\xBB\xBF/', '', trim($row[0])) : '';
-                $raw_date     = isset($row[1]) ? trim($row[1]) : '';
-                $cat_slug     = isset($row[2]) ? trim($row[2]) : '';
-                $content      = isset($row[3]) ? trim($row[3]) : '';
-                $meta_start   = isset($row[4]) ? trim($row[4]) : '';
-                $meta_open    = isset($row[5]) ? trim($row[5]) : '';
-                $meta_price   = isset($row[6]) ? trim($row[6]) : '';
-                $meta_list_txt= isset($row[7]) ? trim($row[7]) : '';
-                $meta_summary = isset($row[8]) ? trim($row[8]) : '';
-                $meta_contact = isset($row[9]) ? trim($row[9]) : '';
-                $thumbnail_url= isset($row[10])? trim($row[10]) : ''; // ★アイキャッチURL
+                // 既存11列 + 拡張列（12:event_key, 13:is_track_usage）
+                $title         = isset( $row[0] ) ? preg_replace( '/^\xEF\xBB\xBF/', '', trim( $row[0] ) ) : '';
+                $raw_date      = isset( $row[1] ) ? trim( $row[1] ) : '';
+                $cat_slug      = isset( $row[2] ) ? trim( $row[2] ) : '';
+                $content       = isset( $row[3] ) ? trim( $row[3] ) : '';
+                $meta_start    = isset( $row[4] ) ? trim( $row[4] ) : '';
+                $meta_open     = isset( $row[5] ) ? trim( $row[5] ) : '';
+                $meta_price    = isset( $row[6] ) ? trim( $row[6] ) : '';
+                $meta_list_txt = isset( $row[7] ) ? trim( $row[7] ) : '';
+                $meta_summary  = isset( $row[8] ) ? trim( $row[8] ) : '';
+                $meta_contact  = isset( $row[9] ) ? trim( $row[9] ) : '';
+                $thumbnail_url = isset( $row[10] ) ? trim( $row[10] ) : '';
+                $event_key     = isset( $row[11] ) ? trim( $row[11] ) : '';
+                if ( empty( $event_key ) ) {
+                    $event_key = jpf_generate_event_key( $raw_date, $meta_start, $cat_slug, $title );
+                }
+                $is_track_usage = isset( $row[12] ) ? (int) trim( $row[12] ) : 0;
 
                 if ( empty( $title ) || empty( $raw_date ) ) {
                     $error_count++;
                     continue;
                 }
 
-                // 日付をWordPressが確実に理解できる形式(Y-m-d H:i:s)に強制変換
-                $formatted_date = date( 'Y-m-d H:i:s', strtotime( str_replace('/', '-', $raw_date) ) );
-                if ( ! $formatted_date || $formatted_date === '1970-01-01 00:00:00' ) {
-                    $formatted_date = current_time( 'mysql' );
-                }
+                $timestamp = strtotime( str_replace( '/', '-', $raw_date ) );
+                $formatted_date = $timestamp ? date( 'Y-m-d H:i:s', $timestamp ) : current_time( 'mysql' );
+                $event_date = $timestamp ? date( 'Y-m-d', $timestamp ) : wp_date( 'Y-m-d', current_time( 'timestamp' ) );
+
+                $existing_post_id = jpf_find_existing_post_id( $event_key, $event_date, $meta_start );
+                $is_update = ! empty( $existing_post_id );
 
                 $post_data = array(
                     'post_title'   => $title,
@@ -75,77 +326,95 @@ function jpf_event_csv_importer_page() {
                     'post_type'    => 'post',
                 );
 
-                $post_id = wp_insert_post( $post_data );
-
-                if ( ! is_wp_error( $post_id ) ) {
-                    
-                    // 強制公開処理
-                    global $wpdb;
-                    $wpdb->update(
-                        $wpdb->posts,
-                        array( 'post_status' => 'publish' ),
-                        array( 'ID' => $post_id ),
-                        array( '%s' ),
-                        array( '%d' )
-                    );
-                    clean_post_cache( $post_id );
-
-                    // カテゴリーの紐付け
-                    if ( ! empty( $cat_slug ) ) {
-                        $term = get_term_by( 'slug', $cat_slug, 'category' );
-                        if ( $term ) {
-                            wp_set_object_terms( $post_id, intval( $term->term_id ), 'category' );
-                        }
-                    }
-
-                    // ACFの保存
-                    update_post_meta( $post_id, 'start', $meta_start );
-                    update_post_meta( $post_id, 'open', $meta_open );
-                    update_post_meta( $post_id, 'price', $meta_price );
-                    update_post_meta( $post_id, '一覧表示用テキスト', $meta_list_txt );
-                    update_post_meta( $post_id, '概要', $meta_summary );
-                    update_post_meta( $post_id, 'お問い合わせ', $meta_contact );
-
-                    // ★アイキャッチ画像の設定
-                    if ( ! empty( $thumbnail_url ) ) {
-                        // URLからメディアのIDを取得するWordPress標準機能
-                        $attachment_id = attachment_url_to_postid( $thumbnail_url );
-                        
-                        if ( $attachment_id ) {
-                            // IDが見つかったらアイキャッチに設定
-                            set_post_thumbnail( $post_id, $attachment_id );
-                        }
-                    }
-
-                    // 成功した記事の編集画面URLを生成
-                    $edit_url = admin_url( 'post.php?post=' . $post_id . '&action=edit' );
-                    $inserted_links[] = '<a href="' . esc_url( $edit_url ) . '" target="_blank">📄 ' . esc_html( $title ) . ' (ID: ' . $post_id . ')</a>';
-
-                    $success_count++;
+                if ( $is_update ) {
+                    $post_data['ID'] = $existing_post_id;
+                    $post_id = wp_update_post( $post_data, true );
                 } else {
+                    $post_id = wp_insert_post( $post_data, true );
+                }
+
+                if ( is_wp_error( $post_id ) ) {
                     $error_count++;
+                    continue;
+                }
+
+                $changed = ! $is_update;
+
+                // カテゴリーの差し替え
+                if ( ! empty( $cat_slug ) ) {
+                    $term = get_term_by( 'slug', $cat_slug, 'category' );
+                    if ( $term && ! is_wp_error( $term ) ) {
+                        $current_terms = wp_get_object_terms( $post_id, 'category', array( 'fields' => 'ids' ) );
+                        $new_terms = array( (int) $term->term_id );
+                        sort( $current_terms );
+                        sort( $new_terms );
+
+                        if ( $current_terms !== $new_terms ) {
+                            wp_set_object_terms( $post_id, (int) $term->term_id, 'category', false );
+                            $changed = true;
+                        }
+                    }
+                }
+
+                // ACF/metaの差分更新
+                $changed = jpf_update_meta_if_changed( $post_id, 'start', $meta_start ) || $changed;
+                $changed = jpf_update_meta_if_changed( $post_id, 'open', $meta_open ) || $changed;
+                $changed = jpf_update_meta_if_changed( $post_id, 'price', $meta_price ) || $changed;
+                $changed = jpf_update_meta_if_changed( $post_id, '一覧表示用テキスト', $meta_list_txt ) || $changed;
+                $changed = jpf_update_meta_if_changed( $post_id, '概要', $meta_summary ) || $changed;
+                $changed = jpf_update_meta_if_changed( $post_id, 'お問い合わせ', $meta_contact ) || $changed;
+                $changed = jpf_update_meta_if_changed( $post_id, 'event_date', $event_date ) || $changed;
+
+                $changed = jpf_update_meta_if_changed( $post_id, 'event_key', $event_key ) || $changed;
+
+                if ( empty( $is_track_usage ) && strpos( $cat_slug, 'track' ) !== false ) {
+                    $is_track_usage = 1;
+                }
+                $changed = jpf_update_meta_if_changed( $post_id, 'is_track_usage', $is_track_usage ) || $changed;
+
+                // アイキャッチ画像差分更新
+                if ( ! empty( $thumbnail_url ) ) {
+                    $attachment_id = attachment_url_to_postid( $thumbnail_url );
+                    if ( $attachment_id ) {
+                        $current_thumbnail_id = (int) get_post_thumbnail_id( $post_id );
+                        if ( $current_thumbnail_id !== (int) $attachment_id ) {
+                            set_post_thumbnail( $post_id, $attachment_id );
+                            $changed = true;
+                        }
+                    }
+                }
+
+                $edit_url = admin_url( 'post.php?post=' . $post_id . '&action=edit' );
+                $inserted_links[] = '<a href="' . esc_url( $edit_url ) . '" target="_blank">📄 ' . esc_html( $title ) . ' (ID: ' . $post_id . ')</a>';
+
+                if ( $is_update ) {
+                    if ( $changed ) {
+                        $updated_count++;
+                    }
+                } else {
+                    $created_count++;
                 }
             }
-            
-            // 結果メッセージ
-            $message = "<div class='updated'><p><strong>インポート完了: 成功 {$success_count}件 / 失敗 {$error_count}件</strong></p>";
+
+            $message .= "<div class='updated'><p><strong>インポート完了: 新規 {$created_count}件 / 更新 {$updated_count}件 / 失敗 {$error_count}件</strong></p>";
             if ( ! empty( $inserted_links ) ) {
-                $message .= "<p>▼ 登録されたデータ（クリックで編集画面を確認できます）<br>" . implode( '<br>', $inserted_links ) . "</p>";
+                $message .= "<p>▼ 処理対象データ（クリックで編集画面を確認できます）<br>" . implode( '<br>', $inserted_links ) . "</p>";
             }
             $message .= "</div>";
-            
         } else {
-            $message = "<div class='error'><p>CSVファイルを選択してください。</p></div>";
+            $message .= "<div class='error'><p>CSVファイルを選択してください。</p></div>";
         }
     }
+
+    $close_settings = jpf_get_close_settings();
 
     // 画面のHTML出力
     ?>
     <div class="wrap">
         <h1>イベントCSV一括登録</h1>
         <?php echo $message; ?>
-        <p>以下の順序で作成した全11列のCSVファイル（UTF-8）をアップロードしてください。<br>
-        1行目はヘッダー行としてスキップされます。使用しない項目は列を消さずに「空欄」のままにしてください。</p>
+        <p>以下の順序で作成したCSVファイル（UTF-8）をアップロードしてください。<br>
+        1行目はヘッダー行としてスキップされます。既存11列に加え、12列目:event_key / 13列目:is_track_usage(0/1) も利用できます。event_keyが空欄の場合は自動生成します。</p>
         <ol>
             <li>投稿タイトル (必須)</li>
             <li>イベント対象日 (必須 / 例: 2026-04-02 10:00:00)</li>
@@ -157,7 +426,9 @@ function jpf_event_csv_importer_page() {
             <li>一覧表示用テキスト (空欄可 / 例: 18:30~21:30&lt;br&gt;残り3枠)</li>
             <li>概要 (空欄可)</li>
             <li>お問い合わせ (空欄可)</li>
-            <li><strong>アイキャッチ画像URL (空欄可 / 例: https://.../slide1.jpg)</strong></li>
+            <li>アイキャッチ画像URL (空欄可 / 例: https://.../slide1.jpg)</li>
+            <li>event_key (任意 / 空欄なら自動生成)</li>
+            <li>is_track_usage (任意 / 1で走路利用扱い)</li>
         </ol>
 
         <form method="post" enctype="multipart/form-data">
@@ -169,6 +440,52 @@ function jpf_event_csv_importer_page() {
                 </tr>
             </table>
             <?php submit_button( 'CSVをインポート', 'primary', 'submit_csv' ); ?>
+        </form>
+
+        <hr>
+
+        <h2>走路利用の締切自動化設定（時間トリガー）</h2>
+        <p>指定時刻になると、対象日の走路利用カテゴリ投稿（event_date=当日）を削除し、受付終了投稿を自動で1件作成します。本文には <code>{date}</code> / <code>{month}</code> が使えます。</p>
+
+        <form method="post">
+            <?php wp_nonce_field( 'jpf_close_settings_nonce' ); ?>
+            <table class="form-table">
+                <tr>
+                    <th scope="row"><label for="trigger_time">実行時刻 (HH:MM)</label></th>
+                    <td><input type="time" name="trigger_time" id="trigger_time" value="<?php echo esc_attr( $close_settings['trigger_time'] ); ?>"></td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="target_category_slugs">削除対象カテゴリースラッグ（複数可）</label></th>
+                    <td><input type="text" name="target_category_slugs" id="target_category_slugs" class="regular-text" value="<?php echo esc_attr( $close_settings['target_category_slugs'] ); ?>">
+                    <p class="description">カンマ区切りで複数指定できます（例: track_group_open,track_group_event）</p></td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="replacement_category">差し替え投稿カテゴリースラッグ</label></th>
+                    <td><input type="text" name="replacement_category" id="replacement_category" class="regular-text" value="<?php echo esc_attr( $close_settings['replacement_category'] ); ?>"></td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="replacement_title">差し替え投稿タイトル</label></th>
+                    <td><input type="text" name="replacement_title" id="replacement_title" class="regular-text" value="<?php echo esc_attr( $close_settings['replacement_title'] ); ?>"></td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="replacement_content">差し替え投稿本文（月ごとのリンク差し替え先）</label></th>
+                    <td><textarea name="replacement_content" id="replacement_content" class="large-text" rows="6"><?php echo esc_textarea( $close_settings['replacement_content'] ); ?></textarea></td>
+                </tr>
+                <tr>
+                    <th scope="row"><label for="replacement_list_text">差し替え一覧表示用テキスト</label></th>
+                    <td><input type="text" name="replacement_list_text" id="replacement_list_text" class="regular-text" value="<?php echo esc_attr( $close_settings['replacement_list_text'] ); ?>"></td>
+                </tr>
+                <tr>
+                    <th scope="row">削除方式</th>
+                    <td>
+                        <label>
+                            <input type="checkbox" name="delete_permanently" value="1" <?php checked( 1, (int) $close_settings['delete_permanently'] ); ?>>
+                            完全削除する（未チェックの場合はゴミ箱へ）
+                        </label>
+                    </td>
+                </tr>
+            </table>
+            <?php submit_button( '締切自動化設定を保存', 'secondary', 'save_close_settings' ); ?>
         </form>
     </div>
     <?php

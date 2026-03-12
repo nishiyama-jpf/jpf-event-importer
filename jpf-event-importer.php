@@ -11,10 +11,12 @@ if ( ! defined( 'ABSPATH' ) ) exit;
 
 const JPF_CLOSE_SETTINGS_OPTION = 'jpf_track_close_settings';
 const JPF_CLOSE_CRON_HOOK = 'jpf_track_usage_close_event';
+const JPF_CLOSE_CRON_RECURRENCE = 'jpf_every_five_minutes';
 
 register_activation_hook( __FILE__, 'jpf_event_csv_importer_activate' );
 register_deactivation_hook( __FILE__, 'jpf_event_csv_importer_deactivate' );
 add_action( JPF_CLOSE_CRON_HOOK, 'jpf_run_track_usage_close_job' );
+add_filter( 'cron_schedules', 'jpf_register_close_cron_schedule' );
 
 /**
  * 1. 管理画面にメニューを追加
@@ -31,10 +33,24 @@ function jpf_event_csv_importer_menu() {
     );
 }
 
-function jpf_event_csv_importer_activate() {
-    if ( ! wp_next_scheduled( JPF_CLOSE_CRON_HOOK ) ) {
-        wp_schedule_event( time() + MINUTE_IN_SECONDS * 5, 'hourly', JPF_CLOSE_CRON_HOOK );
+function jpf_register_close_cron_schedule( $schedules ) {
+    if ( ! isset( $schedules[ JPF_CLOSE_CRON_RECURRENCE ] ) ) {
+        $schedules[ JPF_CLOSE_CRON_RECURRENCE ] = array(
+            'interval' => 5 * MINUTE_IN_SECONDS,
+            'display'  => 'Every 5 Minutes (JPF)',
+        );
     }
+
+    return $schedules;
+}
+
+function jpf_event_csv_importer_activate() {
+    $timestamp = wp_next_scheduled( JPF_CLOSE_CRON_HOOK );
+    if ( $timestamp ) {
+        wp_unschedule_event( $timestamp, JPF_CLOSE_CRON_HOOK );
+    }
+
+    wp_schedule_event( time() + MINUTE_IN_SECONDS, JPF_CLOSE_CRON_RECURRENCE, JPF_CLOSE_CRON_HOOK );
 }
 
 function jpf_event_csv_importer_deactivate() {
@@ -160,11 +176,17 @@ function jpf_generate_event_key( $raw_date, $meta_start, $cat_slug, $title ) {
 function jpf_run_track_usage_close_job() {
     $settings = jpf_get_close_settings();
 
-    $trigger_time = isset( $settings['trigger_time'] ) ? $settings['trigger_time'] : '23:55';
-    $current_time = wp_date( 'H:i', current_time( 'timestamp' ) );
+    $trigger_time = isset( $settings['trigger_time'] ) ? (string) $settings['trigger_time'] : '23:55';
+    if ( ! preg_match( '/^\d{2}:\d{2}$/', $trigger_time ) ) {
+        return;
+    }
 
-    // 時間一致時のみ動かす（hourlyイベントを時間ゲートで利用）
-    if ( $current_time !== $trigger_time ) {
+    $current_timestamp = current_time( 'timestamp' );
+    $today = wp_date( 'Y-m-d', $current_timestamp );
+    $trigger_timestamp = strtotime( $today . ' ' . $trigger_time . ':00' );
+
+    // 指定時刻を過ぎるまでは何もしない（過ぎたら次回Cron以降で実行）
+    if ( ! $trigger_timestamp || $current_timestamp < $trigger_timestamp ) {
         return;
     }
 
@@ -174,7 +196,6 @@ function jpf_run_track_usage_close_job() {
         return;
     }
 
-    $today = wp_date( 'Y-m-d', current_time( 'timestamp' ) );
 
     $target_post_ids = get_posts( array(
         'post_type'      => 'post',

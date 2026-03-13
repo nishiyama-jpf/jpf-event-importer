@@ -126,15 +126,22 @@ function jpf_render_template_tokens( $text, $today ) {
 }
 
 function jpf_find_category_by_slug( $slug ) {
-    $slug = trim( (string) $slug );
-    if ( $slug === '' ) {
+    $raw_value = trim( (string) $slug );
+    if ( $raw_value === '' ) {
         return false;
     }
 
+    if ( ctype_digit( $raw_value ) ) {
+        $term = get_term_by( 'id', (int) $raw_value, 'category' );
+        if ( $term && ! is_wp_error( $term ) ) {
+            return $term;
+        }
+    }
+
     $candidates = array_unique( array_filter( array(
-        $slug,
-        sanitize_title( $slug ),
-        urldecode( $slug ),
+        $raw_value,
+        sanitize_title( $raw_value ),
+        urldecode( $raw_value ),
     ) ) );
 
     foreach ( $candidates as $candidate ) {
@@ -142,6 +149,11 @@ function jpf_find_category_by_slug( $slug ) {
         if ( $term && ! is_wp_error( $term ) ) {
             return $term;
         }
+    }
+
+    $term = get_term_by( 'name', $raw_value, 'category' );
+    if ( $term && ! is_wp_error( $term ) ) {
+        return $term;
     }
 
     return false;
@@ -423,7 +435,7 @@ function jpf_event_csv_importer_page() {
         $settings = array(
             'trigger_time'          => isset( $_POST['trigger_time'] ) ? sanitize_text_field( wp_unslash( $_POST['trigger_time'] ) ) : '23:55',
             'target_category_slugs' => isset( $_POST['target_category_slugs'] ) ? sanitize_text_field( wp_unslash( $_POST['target_category_slugs'] ) ) : '',
-            'replacement_category'  => isset( $_POST['replacement_category'] ) ? sanitize_title( wp_unslash( $_POST['replacement_category'] ) ) : '',
+            'replacement_category'  => isset( $_POST['replacement_category'] ) ? sanitize_text_field( wp_unslash( $_POST['replacement_category'] ) ) : '',
             'replacement_title'     => isset( $_POST['replacement_title'] ) ? sanitize_text_field( wp_unslash( $_POST['replacement_title'] ) ) : '',
             'replacement_content'   => isset( $_POST['replacement_content'] ) ? wp_kses_post( wp_unslash( $_POST['replacement_content'] ) ) : '',
             'replacement_list_text' => isset( $_POST['replacement_list_text'] ) ? sanitize_text_field( wp_unslash( $_POST['replacement_list_text'] ) ) : '',
@@ -628,12 +640,12 @@ function jpf_event_csv_importer_page() {
                     <td><input type="time" name="trigger_time" id="trigger_time" value="<?php echo esc_attr( $close_settings['trigger_time'] ); ?>"></td>
                 </tr>
                 <tr>
-                    <th scope="row"><label for="target_category_slugs">削除対象カテゴリースラッグ（複数可）</label></th>
+                    <th scope="row"><label for="target_category_slugs">削除対象カテゴリ（スラッグ/名称/ID、複数可）</label></th>
                     <td><input type="text" name="target_category_slugs" id="target_category_slugs" class="regular-text" value="<?php echo esc_attr( $close_settings['target_category_slugs'] ); ?>">
                     <p class="description">カンマ区切りで複数指定できます（例: track_group_open,track_group_event）</p></td>
                 </tr>
                 <tr>
-                    <th scope="row"><label for="replacement_category">差し替え投稿カテゴリースラッグ</label></th>
+                    <th scope="row"><label for="replacement_category">差し替え投稿カテゴリ（スラッグ/名称/ID）</label></th>
                     <td><input type="text" name="replacement_category" id="replacement_category" class="regular-text" value="<?php echo esc_attr( $close_settings['replacement_category'] ); ?>"></td>
                 </tr>
                 <tr>
@@ -652,7 +664,7 @@ function jpf_event_csv_importer_page() {
                     <th scope="row"><label for="replacement_rules">カテゴリ別差し替えルール（任意）</label></th>
                     <td>
                         <textarea name="replacement_rules" id="replacement_rules" class="large-text code" rows="6"><?php echo esc_textarea( $close_settings['replacement_rules'] ); ?></textarea>
-                        <p class="description">1行に1ルール、<code>削除対象カテゴリ|差し替えカテゴリ|タイトル|本文|一覧表示用テキスト</code> の順で指定します。未指定項目は共通設定を利用します。</p>
+                        <p class="description">1行に1ルール、<code>削除対象カテゴリ|差し替えカテゴリ|タイトル|本文|一覧表示用テキスト（カテゴリはスラッグ/名称/ID対応）</code> の順で指定します。未指定項目は共通設定を利用します。</p>
                         <p class="description">例: <code>track_group_open|track_group_open|{date} 受付終了|本日の受付は終了しました。|受付終了</code></p>
                     </td>
                 </tr>

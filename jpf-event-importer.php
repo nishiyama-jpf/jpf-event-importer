@@ -248,6 +248,33 @@ function jpf_generate_event_key( $raw_date, $meta_start, $cat_slug, $title ) {
     return 'jpf_' . md5( $base );
 }
 
+function jpf_collect_track_usage_candidates( $post_ids, $today ) {
+    $candidates = array();
+
+    foreach ( $post_ids as $post_id ) {
+        $post = get_post( $post_id );
+        if ( ! $post ) {
+            continue;
+        }
+
+        $event_date = (string) get_post_meta( $post_id, 'event_date', true );
+        $post_date = mysql2date( 'Y-m-d', $post->post_date, false );
+
+        $candidates[] = array(
+            'post_id'              => (int) $post_id,
+            'post_title'           => get_the_title( $post_id ),
+            'post_date'            => $post_date,
+            'post_date_time'       => mysql2date( 'Y-m-d H:i:s', $post->post_date, false ),
+            'event_date'           => $event_date,
+            'is_track_usage'       => (int) get_post_meta( $post_id, 'is_track_usage', true ),
+            'matches_today'        => ( $event_date === $today || ( $event_date === '' && $post_date === $today ) ),
+            'uses_fallback_delete' => ( $event_date === '' ),
+        );
+    }
+
+    return $candidates;
+}
+
 function jpf_run_track_usage_close_job() {
     $settings = jpf_get_close_settings();
 
@@ -309,15 +336,12 @@ function jpf_run_track_usage_close_job() {
     );
 
     $candidate_target_post_ids = get_posts( $target_posts_query_args );
+    $candidate_target_posts = jpf_collect_track_usage_candidates( $candidate_target_post_ids, $today );
     $target_post_ids = array();
 
-    foreach ( $candidate_target_post_ids as $candidate_post_id ) {
-        $event_date = (string) get_post_meta( $candidate_post_id, 'event_date', true );
-        $candidate_post = get_post( $candidate_post_id );
-        $post_date = $candidate_post ? mysql2date( 'Y-m-d', $candidate_post->post_date, false ) : '';
-
-        if ( $event_date === $today || ( $event_date === '' && $post_date === $today ) ) {
-            $target_post_ids[] = (int) $candidate_post_id;
+    foreach ( $candidate_target_posts as $candidate_target_post ) {
+        if ( ! empty( $candidate_target_post['matches_today'] ) ) {
+            $target_post_ids[] = (int) $candidate_target_post['post_id'];
         }
     }
 
@@ -333,26 +357,7 @@ function jpf_run_track_usage_close_job() {
     ) );
 
     if ( empty( $target_post_ids ) ) {
-        $diagnostic_post_ids = get_posts( array(
-            'post_type'      => 'post',
-            'post_status'    => 'publish',
-            'fields'         => 'ids',
-            'posts_per_page' => 5,
-            'tax_query'      => $target_posts_query_args['tax_query'],
-            'orderby'        => 'date',
-            'order'          => 'DESC',
-        ) );
-        $diagnostic_posts = array();
-
-        foreach ( $diagnostic_post_ids as $diagnostic_post_id ) {
-            $diagnostic_post = get_post( $diagnostic_post_id );
-            $diagnostic_posts[] = array(
-                'post_id'            => (int) $diagnostic_post_id,
-                'post_title'         => get_the_title( $diagnostic_post_id ),
-                'post_date'          => $diagnostic_post ? mysql2date( 'Y-m-d H:i:s', $diagnostic_post->post_date, false ) : '',
-                'event_date'         => get_post_meta( $diagnostic_post_id, 'event_date', true ),
-            );
-        }
+        $diagnostic_posts = array_slice( $candidate_target_posts, 0, 5 );
 
         jpf_add_close_log( 'info', '削除対象0件のためカテゴリ内投稿を診断しました。', array(
             'date'                  => $today,
@@ -362,6 +367,29 @@ function jpf_run_track_usage_close_job() {
             'target_term_ids'       => $target_term_ids,
             'unresolved_targets'    => $parsed_target_categories['unresolved_tokens'],
         ) );
+
+        $fallback_target_post_ids = array();
+        foreach ( $candidate_target_posts as $candidate_target_post ) {
+            if ( ! empty( $candidate_target_post['uses_fallback_delete'] ) ) {
+                $fallback_target_post_ids[] = (int) $candidate_target_post['post_id'];
+            }
+        }
+
+        if ( ! empty( $fallback_target_post_ids ) ) {
+            $target_post_ids = $fallback_target_post_ids;
+            jpf_add_close_log( 'info', 'event_date未設定の既存投稿を削除対象として採用しました。', array(
+                'date'             => $today,
+                'lookup_basis'     => 'category_posts_without_event_date',
+                'fallback_posts'   => array_slice( array_values( array_filter(
+                    $candidate_target_posts,
+                    function ( $candidate_target_post ) {
+                        return ! empty( $candidate_target_post['uses_fallback_delete'] );
+                    }
+                ) ), 0, 5 ),
+                'fallback_count'   => count( $fallback_target_post_ids ),
+                'configured_terms' => $target_term_ids,
+            ) );
+        }
     }
 
     $matched_target_term_ids = array();
@@ -719,7 +747,7 @@ function jpf_event_csv_importer_page() {
         <hr>
 
         <h2>走路利用の締切自動化設定（時間トリガー）</h2>
-        <p>指定時刻になると、対象日の走路利用カテゴリ投稿（event_date=当日）を削除し、受付終了投稿を自動で1件作成します。本文には <code>{date}</code> / <code>{month}</code> が使えます。</p>
+        <p>指定時刻になると、対象日の走路利用カテゴリ投稿（<code>event_date=当日</code>）を削除し、受付終了投稿を自動で1件作成します。<code>event_date</code> が未設定の既存投稿しかない場合は、そのカテゴリ内投稿をフォールバックで削除対象にします。本文には <code>{date}</code> / <code>{month}</code> が使えます。</p>
 
         <form method="post">
             <?php wp_nonce_field( 'jpf_close_settings_nonce' ); ?>

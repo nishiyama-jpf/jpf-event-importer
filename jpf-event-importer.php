@@ -132,7 +132,14 @@ function jpf_find_category_by_slug( $slug ) {
     }
 
     if ( ctype_digit( $raw_value ) ) {
-        $term = get_term_by( 'id', (int) $raw_value, 'category' );
+        $numeric_value = (int) $raw_value;
+
+        $term = get_term_by( 'id', $numeric_value, 'category' );
+        if ( $term && ! is_wp_error( $term ) ) {
+            return $term;
+        }
+
+        $term = get_term_by( 'term_taxonomy_id', $numeric_value, 'category' );
         if ( $term && ! is_wp_error( $term ) ) {
             return $term;
         }
@@ -299,16 +306,20 @@ function jpf_run_track_usage_close_job() {
                 'terms'    => $target_term_ids,
             ),
         ),
-        'date_query'     => array(
-            array(
-                'year'  => (int) $now->format( 'Y' ),
-                'month' => (int) $now->format( 'n' ),
-                'day'   => (int) $now->format( 'j' ),
-                'column' => 'post_date',
-            ),
-        ),
     );
-    $target_post_ids = get_posts( $target_posts_query_args );
+
+    $candidate_target_post_ids = get_posts( $target_posts_query_args );
+    $target_post_ids = array();
+
+    foreach ( $candidate_target_post_ids as $candidate_post_id ) {
+        $event_date = (string) get_post_meta( $candidate_post_id, 'event_date', true );
+        $candidate_post = get_post( $candidate_post_id );
+        $post_date = $candidate_post ? mysql2date( 'Y-m-d', $candidate_post->post_date, false ) : '';
+
+        if ( $event_date === $today || ( $event_date === '' && $post_date === $today ) ) {
+            $target_post_ids[] = (int) $candidate_post_id;
+        }
+    }
 
     jpf_add_close_log( 'info', '削除対象の抽出結果を確認しました。', array(
         'date'               => $today,
@@ -317,7 +328,8 @@ function jpf_run_track_usage_close_job() {
         'resolved_targets'   => $parsed_target_categories['resolved_terms'],
         'unresolved_targets' => $parsed_target_categories['unresolved_tokens'],
         'matched_posts'      => count( $target_post_ids ),
-        'lookup_basis'       => 'post_date',
+        'lookup_basis'       => 'event_date_or_post_date',
+        'candidate_posts'    => count( $candidate_target_post_ids ),
     ) );
 
     if ( empty( $target_post_ids ) ) {
@@ -338,13 +350,13 @@ function jpf_run_track_usage_close_job() {
                 'post_id'            => (int) $diagnostic_post_id,
                 'post_title'         => get_the_title( $diagnostic_post_id ),
                 'post_date'          => $diagnostic_post ? mysql2date( 'Y-m-d H:i:s', $diagnostic_post->post_date, false ) : '',
-                'event_date_legacy'  => get_post_meta( $diagnostic_post_id, 'event_date', true ),
+                'event_date'         => get_post_meta( $diagnostic_post_id, 'event_date', true ),
             );
         }
 
         jpf_add_close_log( 'info', '削除対象0件のためカテゴリ内投稿を診断しました。', array(
             'date'                  => $today,
-            'lookup_basis'          => 'post_date',
+            'lookup_basis'          => 'event_date_or_post_date',
             'candidate_posts'       => $diagnostic_posts,
             'configured_targets'    => $parsed_target_categories['tokens'],
             'target_term_ids'       => $target_term_ids,

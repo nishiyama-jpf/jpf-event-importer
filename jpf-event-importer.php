@@ -269,16 +269,12 @@ function jpf_run_track_usage_close_job() {
                 'terms'    => $target_term_ids,
             ),
         ),
-        'meta_query'     => array(
-            'relation' => 'OR',
+        'date_query'     => array(
             array(
-                'key'   => 'event_date',
-                'value' => $today,
-            ),
-            array(
-                'key'     => 'event_date',
-                'value'   => $today,
-                'compare' => 'LIKE',
+                'year'  => (int) $now->format( 'Y' ),
+                'month' => (int) $now->format( 'n' ),
+                'day'   => (int) $now->format( 'j' ),
+                'column' => 'post_date',
             ),
         ),
     );
@@ -288,6 +284,7 @@ function jpf_run_track_usage_close_job() {
         'date'            => $today,
         'target_term_ids' => $target_term_ids,
         'matched_posts'   => count( $target_post_ids ),
+        'lookup_basis'    => 'post_date',
     ) );
 
     if ( empty( $target_post_ids ) ) {
@@ -297,21 +294,26 @@ function jpf_run_track_usage_close_job() {
             'fields'         => 'ids',
             'posts_per_page' => 5,
             'tax_query'      => $target_posts_query_args['tax_query'],
+            'orderby'        => 'date',
+            'order'          => 'DESC',
         ) );
         $diagnostic_posts = array();
 
         foreach ( $diagnostic_post_ids as $diagnostic_post_id ) {
+            $diagnostic_post = get_post( $diagnostic_post_id );
             $diagnostic_posts[] = array(
-                'post_id'    => (int) $diagnostic_post_id,
-                'post_title' => get_the_title( $diagnostic_post_id ),
-                'event_date' => get_post_meta( $diagnostic_post_id, 'event_date', true ),
+                'post_id'            => (int) $diagnostic_post_id,
+                'post_title'         => get_the_title( $diagnostic_post_id ),
+                'post_date'          => $diagnostic_post ? mysql2date( 'Y-m-d H:i:s', $diagnostic_post->post_date, false ) : '',
+                'event_date_legacy'  => get_post_meta( $diagnostic_post_id, 'event_date', true ),
             );
         }
 
         jpf_add_close_log( 'info', '削除対象0件のためカテゴリ内投稿を診断しました。', array(
-            'date'             => $today,
-            'candidate_posts'  => $diagnostic_posts,
-            'target_term_ids'  => $target_term_ids,
+            'date'                  => $today,
+            'lookup_basis'          => 'post_date',
+            'candidate_posts'       => $diagnostic_posts,
+            'target_term_ids'       => $target_term_ids,
         ) );
     }
 
@@ -368,12 +370,14 @@ function jpf_run_track_usage_close_job() {
         $replacement_content = jpf_render_template_tokens( ! empty( $rule['replacement_content'] ) ? $rule['replacement_content'] : $settings['replacement_content'], $today );
         $replacement_list_text = jpf_render_template_tokens( ! empty( $rule['replacement_list_text'] ) ? $rule['replacement_list_text'] : $settings['replacement_list_text'], $today );
 
+        $replacement_post_time = $today . ' ' . current_time( 'H:i:s' );
         $new_post_id = wp_insert_post( array(
-            'post_title'   => $replacement_title,
-            'post_content' => $replacement_content,
-            'post_status'  => 'publish',
-            'post_type'    => 'post',
-            'post_date'    => current_time( 'mysql' ),
+            'post_title'     => $replacement_title,
+            'post_content'   => $replacement_content,
+            'post_status'    => 'publish',
+            'post_type'      => 'post',
+            'post_date'      => $replacement_post_time,
+            'post_date_gmt'  => get_gmt_from_date( $replacement_post_time ),
         ) );
 
         if ( is_wp_error( $new_post_id ) ) {

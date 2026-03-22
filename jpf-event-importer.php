@@ -257,7 +257,7 @@ function jpf_run_track_usage_close_job() {
     }
 
 
-    $target_post_ids = get_posts( array(
+    $target_posts_query_args = array(
         'post_type'      => 'post',
         'post_status'    => 'publish',
         'fields'         => 'ids',
@@ -270,12 +270,50 @@ function jpf_run_track_usage_close_job() {
             ),
         ),
         'meta_query'     => array(
+            'relation' => 'OR',
             array(
                 'key'   => 'event_date',
                 'value' => $today,
             ),
+            array(
+                'key'     => 'event_date',
+                'value'   => $today,
+                'compare' => 'LIKE',
+            ),
         ),
+    );
+    $target_post_ids = get_posts( $target_posts_query_args );
+
+    jpf_add_close_log( 'info', '削除対象の抽出結果を確認しました。', array(
+        'date'            => $today,
+        'target_term_ids' => $target_term_ids,
+        'matched_posts'   => count( $target_post_ids ),
     ) );
+
+    if ( empty( $target_post_ids ) ) {
+        $diagnostic_post_ids = get_posts( array(
+            'post_type'      => 'post',
+            'post_status'    => 'publish',
+            'fields'         => 'ids',
+            'posts_per_page' => 5,
+            'tax_query'      => $target_posts_query_args['tax_query'],
+        ) );
+        $diagnostic_posts = array();
+
+        foreach ( $diagnostic_post_ids as $diagnostic_post_id ) {
+            $diagnostic_posts[] = array(
+                'post_id'    => (int) $diagnostic_post_id,
+                'post_title' => get_the_title( $diagnostic_post_id ),
+                'event_date' => get_post_meta( $diagnostic_post_id, 'event_date', true ),
+            );
+        }
+
+        jpf_add_close_log( 'info', '削除対象0件のためカテゴリ内投稿を診断しました。', array(
+            'date'             => $today,
+            'candidate_posts'  => $diagnostic_posts,
+            'target_term_ids'  => $target_term_ids,
+        ) );
+    }
 
     $matched_target_term_ids = array();
     $force_delete = ! empty( $settings['delete_permanently'] );

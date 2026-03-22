@@ -368,25 +368,20 @@ function jpf_run_track_usage_close_job() {
             'unresolved_targets'    => $parsed_target_categories['unresolved_tokens'],
         ) );
 
-        $fallback_target_post_ids = array();
-        foreach ( $candidate_target_posts as $candidate_target_post ) {
-            if ( ! empty( $candidate_target_post['uses_fallback_delete'] ) ) {
-                $fallback_target_post_ids[] = (int) $candidate_target_post['post_id'];
+        $legacy_posts_without_event_date = array_values( array_filter(
+            $candidate_target_posts,
+            function ( $candidate_target_post ) {
+                return ! empty( $candidate_target_post['uses_fallback_delete'] )
+                    && empty( $candidate_target_post['matches_today'] );
             }
-        }
+        ) );
 
-        if ( ! empty( $fallback_target_post_ids ) ) {
-            $target_post_ids = $fallback_target_post_ids;
-            jpf_add_close_log( 'info', 'event_date未設定の既存投稿を削除対象として採用しました。', array(
+        if ( ! empty( $legacy_posts_without_event_date ) ) {
+            jpf_add_close_log( 'info', 'event_date未設定の過去投稿は削除対象から除外しました。', array(
                 'date'             => $today,
-                'lookup_basis'     => 'category_posts_without_event_date',
-                'fallback_posts'   => array_slice( array_values( array_filter(
-                    $candidate_target_posts,
-                    function ( $candidate_target_post ) {
-                        return ! empty( $candidate_target_post['uses_fallback_delete'] );
-                    }
-                ) ), 0, 5 ),
-                'fallback_count'   => count( $fallback_target_post_ids ),
+                'lookup_basis'     => 'event_date_or_post_date',
+                'skipped_posts'    => array_slice( $legacy_posts_without_event_date, 0, 5 ),
+                'skipped_count'    => count( $legacy_posts_without_event_date ),
                 'configured_terms' => $target_term_ids,
             ) );
         }

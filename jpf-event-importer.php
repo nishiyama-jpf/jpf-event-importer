@@ -160,18 +160,43 @@ function jpf_find_category_by_slug( $slug ) {
 }
 
 
-function jpf_parse_category_term_ids( $raw_slugs ) {
-    $slugs = array_filter( array_map( 'trim', explode( ',', (string) $raw_slugs ) ) );
-    $term_ids = array();
+function jpf_parse_category_inputs( $raw_values ) {
+    $tokens = preg_split( '/[\s,|]+/', (string) $raw_values );
+    $tokens = array_values( array_filter( array_map( 'trim', $tokens ), 'strlen' ) );
 
-    foreach ( $slugs as $slug ) {
-        $term = jpf_find_category_by_slug( $slug );
+    $term_ids = array();
+    $resolved_terms = array();
+    $unresolved_tokens = array();
+
+    foreach ( $tokens as $token ) {
+        $term = jpf_find_category_by_slug( $token );
         if ( $term && ! is_wp_error( $term ) ) {
-            $term_ids[] = (int) $term->term_id;
+            $term_id = (int) $term->term_id;
+            $term_ids[] = $term_id;
+            $resolved_terms[] = array(
+                'input'    => $token,
+                'term_id'  => $term_id,
+                'slug'     => (string) $term->slug,
+                'name'     => (string) $term->name,
+            );
+            continue;
         }
+
+        $unresolved_tokens[] = $token;
     }
 
-    return array_values( array_unique( $term_ids ) );
+    return array(
+        'tokens'            => $tokens,
+        'term_ids'          => array_values( array_unique( $term_ids ) ),
+        'resolved_terms'    => $resolved_terms,
+        'unresolved_tokens' => array_values( array_unique( $unresolved_tokens ) ),
+    );
+}
+
+function jpf_parse_category_term_ids( $raw_slugs ) {
+    $parsed = jpf_parse_category_inputs( $raw_slugs );
+
+    return $parsed['term_ids'];
 }
 
 function jpf_parse_replacement_rules( $raw_rules ) {
@@ -250,9 +275,14 @@ function jpf_run_track_usage_close_job() {
     }
 
     $target_category_slugs = isset( $settings['target_category_slugs'] ) ? $settings['target_category_slugs'] : '';
-    $target_term_ids = jpf_parse_category_term_ids( $target_category_slugs );
+    $parsed_target_categories = jpf_parse_category_inputs( $target_category_slugs );
+    $target_term_ids = $parsed_target_categories['term_ids'];
     if ( empty( $target_term_ids ) ) {
-        jpf_add_close_log( 'error', '自動削除をスキップ: 削除対象カテゴリが見つかりません。', array( 'target_category_slugs' => $target_category_slugs ) );
+        jpf_add_close_log( 'error', '自動削除をスキップ: 削除対象カテゴリが見つかりません。', array(
+            'target_category_slugs' => $target_category_slugs,
+            'configured_targets'    => $parsed_target_categories['tokens'],
+            'unresolved_targets'    => $parsed_target_categories['unresolved_tokens'],
+        ) );
         return;
     }
 
@@ -281,10 +311,13 @@ function jpf_run_track_usage_close_job() {
     $target_post_ids = get_posts( $target_posts_query_args );
 
     jpf_add_close_log( 'info', '削除対象の抽出結果を確認しました。', array(
-        'date'            => $today,
-        'target_term_ids' => $target_term_ids,
-        'matched_posts'   => count( $target_post_ids ),
-        'lookup_basis'    => 'post_date',
+        'date'               => $today,
+        'configured_targets' => $parsed_target_categories['tokens'],
+        'target_term_ids'    => $target_term_ids,
+        'resolved_targets'   => $parsed_target_categories['resolved_terms'],
+        'unresolved_targets' => $parsed_target_categories['unresolved_tokens'],
+        'matched_posts'      => count( $target_post_ids ),
+        'lookup_basis'       => 'post_date',
     ) );
 
     if ( empty( $target_post_ids ) ) {
@@ -313,7 +346,9 @@ function jpf_run_track_usage_close_job() {
             'date'                  => $today,
             'lookup_basis'          => 'post_date',
             'candidate_posts'       => $diagnostic_posts,
+            'configured_targets'    => $parsed_target_categories['tokens'],
             'target_term_ids'       => $target_term_ids,
+            'unresolved_targets'    => $parsed_target_categories['unresolved_tokens'],
         ) );
     }
 

@@ -72,11 +72,18 @@ function jpf_schedule_daily_close_jobs() {
     }
 }
 
-function jpf_is_in_close_window( DateTimeImmutable $now ) {
-    $hour = (int) $now->format( 'H' );
-    $minute = (int) $now->format( 'i' );
+function jpf_is_valid_close_scheduled_time( $scheduled_time, DateTimeZone $timezone ) {
+    $scheduled_value = trim( (string) $scheduled_time );
+    if ( $scheduled_value === '' ) {
+        return false;
+    }
 
-    return ( $hour === 3 && in_array( $minute, array( 0, 5, 10 ), true ) );
+    $scheduled_datetime = DateTimeImmutable::createFromFormat( 'Y-m-d H:i:s', $scheduled_value, $timezone );
+    if ( ! $scheduled_datetime ) {
+        return false;
+    }
+
+    return in_array( $scheduled_datetime->format( 'H:i' ), JPF_CLOSE_RUN_TIMES, true );
 }
 
 function jpf_set_common_close_thumbnail( $post_id ) {
@@ -311,21 +318,22 @@ function jpf_run_track_usage_close_job( $scheduled_time = '' ) {
     $now = new DateTimeImmutable( 'now', $timezone );
     $today = $now->format( 'Y-m-d' );
 
+    if ( wp_doing_cron() && ! jpf_is_valid_close_scheduled_time( $scheduled_time, $timezone ) ) {
+        jpf_add_close_log( 'info', '実行時間帯外のCron実行をスキップしました。', array(
+            'date'         => $today,
+            'current_time' => $now->format( 'H:i:s' ),
+            'scheduled_at' => (string) $scheduled_time,
+            'run_times'    => JPF_CLOSE_RUN_TIMES,
+        ) );
+        return;
+    }
+
     jpf_add_close_log( 'info', '締切自動化ジョブを開始しました。', array(
         'date'         => $today,
         'current_time' => $now->format( 'H:i:s' ),
         'scheduled_at' => (string) $scheduled_time,
         'run_times'    => JPF_CLOSE_RUN_TIMES,
     ) );
-
-    if ( wp_doing_cron() && ! jpf_is_in_close_window( $now ) ) {
-        jpf_add_close_log( 'info', '実行時間帯外のCron実行をスキップしました。', array(
-            'date'         => $today,
-            'current_time' => $now->format( 'H:i:s' ),
-            'run_times'    => JPF_CLOSE_RUN_TIMES,
-        ) );
-        return;
-    }
 
     $target_category_slugs = isset( $settings['target_category_slugs'] ) ? $settings['target_category_slugs'] : '';
     $parsed_target_categories = jpf_parse_category_inputs( $target_category_slugs );

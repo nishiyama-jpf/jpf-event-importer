@@ -11,7 +11,9 @@ if ( ! defined( 'ABSPATH' ) ) exit;
 
 const JPF_CLOSE_SETTINGS_OPTION = 'jpf_track_close_settings';
 const JPF_CLOSE_CRON_HOOK = 'jpf_track_usage_close_event';
+const JPF_CLOSE_MINUTE_CRON_HOOK = 'jpf_track_usage_close_event_minute_tick';
 const JPF_CLOSE_LOG_OPTION = 'jpf_track_close_logs';
+const JPF_CLOSE_DISPATCH_STATE_OPTION = 'jpf_track_close_dispatch_state';
 const JPF_CLOSE_LOG_LIMIT = 100;
 const JPF_CLOSE_COMMON_THUMBNAIL_URL = 'https://chiba-jpf-dome.com/wp-content/uploads/2022/09/slide1.jpg';
 const JPF_CLOSE_RUN_TIMES = array( '03:00', '03:05', '03:10' );
@@ -19,7 +21,9 @@ const JPF_CLOSE_RUN_TIMES = array( '03:00', '03:05', '03:10' );
 register_activation_hook( __FILE__, 'jpf_event_csv_importer_activate' );
 register_deactivation_hook( __FILE__, 'jpf_event_csv_importer_deactivate' );
 add_action( JPF_CLOSE_CRON_HOOK, 'jpf_run_track_usage_close_job' );
-add_action( 'init', 'jpf_schedule_daily_close_jobs' );
+add_action( JPF_CLOSE_MINUTE_CRON_HOOK, 'jpf_dispatch_due_close_jobs' );
+add_action( 'init', 'jpf_ensure_close_cron_runner' );
+add_filter( 'cron_schedules', 'jpf_add_every_minute_schedule' );
 
 /**
  * 1. 管理画面にメニューを追加
@@ -38,38 +42,87 @@ function jpf_event_csv_importer_menu() {
 
 function jpf_event_csv_importer_activate() {
     wp_clear_scheduled_hook( JPF_CLOSE_CRON_HOOK );
-    jpf_schedule_daily_close_jobs();
+    wp_clear_scheduled_hook( JPF_CLOSE_MINUTE_CRON_HOOK );
+    delete_option( JPF_CLOSE_DISPATCH_STATE_OPTION );
+    jpf_ensure_close_cron_runner();
 }
 
 function jpf_event_csv_importer_deactivate() {
     wp_clear_scheduled_hook( JPF_CLOSE_CRON_HOOK );
+    wp_clear_scheduled_hook( JPF_CLOSE_MINUTE_CRON_HOOK );
 }
 
-function jpf_schedule_daily_close_jobs() {
-    $timezone = wp_timezone();
-    $now = new DateTimeImmutable( 'now', $timezone );
-    $dates_to_schedule = array(
-        $now->format( 'Y-m-d' ),
-        $now->modify( '+1 day' )->format( 'Y-m-d' ),
-    );
+function jpf_add_every_minute_schedule( $schedules ) {
+    if ( ! isset( $schedules['every_minute'] ) ) {
+        $schedules['every_minute'] = array(
+            'interval' => MINUTE_IN_SECONDS,
+            'display'  => __( 'Every Minute' ),
+        );
+    }
 
-    foreach ( $dates_to_schedule as $date_string ) {
-        foreach ( JPF_CLOSE_RUN_TIMES as $run_time ) {
-            $run_datetime = DateTimeImmutable::createFromFormat( 'Y-m-d H:i:s', $date_string . ' ' . $run_time . ':00', $timezone );
-            if ( ! $run_datetime ) {
-                continue;
-            }
+    return $schedules;
+}
 
-            $run_timestamp = $run_datetime->getTimestamp();
-            if ( $run_timestamp <= time() ) {
-                continue;
-            }
+function jpf_ensure_close_cron_runner() {
+    if ( ! wp_next_scheduled( JPF_CLOSE_MINUTE_CRON_HOOK ) ) {
+        wp_schedule_event( time() + 10, 'every_minute', JPF_CLOSE_MINUTE_CRON_HOOK );
+    }
+}
 
-            if ( ! wp_next_scheduled( JPF_CLOSE_CRON_HOOK, array( $run_datetime->format( 'Y-m-d H:i:s' ) ) ) ) {
-                wp_schedule_single_event( $run_timestamp, JPF_CLOSE_CRON_HOOK, array( $run_datetime->format( 'Y-m-d H:i:s' ) ) );
-            }
+function jpf_get_due_close_slots( DateTimeImmutable $now ) {
+    $timezone = $now->getTimezone();
+    $today = $now->format( 'Y-m-d' );
+    $due_slots = array();
+
+    foreach ( JPF_CLOSE_RUN_TIMES as $run_time ) {
+        $run_datetime = DateTimeImmutable::createFromFormat( 'Y-m-d H:i:s', $today . ' ' . $run_time . ':00', $timezone );
+        if ( ! $run_datetime ) {
+            continue;
+        }
+
+        if ( $run_datetime->getTimestamp() <= $now->getTimestamp() ) {
+            $due_slots[] = $run_datetime->format( 'Y-m-d H:i:s' );
         }
     }
+
+    return $due_slots;
+}
+
+function jpf_dispatch_due_close_jobs() {
+    $timezone = wp_timezone();
+    $now = new DateTimeImmutable( 'now', $timezone );
+    $today = $now->format( 'Y-m-d' );
+    $due_slots = jpf_get_due_close_slots( $now );
+    if ( empty( $due_slots ) ) {
+        return;
+    }
+
+    $dispatch_state = get_option( JPF_CLOSE_DISPATCH_STATE_OPTION, array() );
+    if ( ! is_array( $dispatch_state ) || ! isset( $dispatch_state['date'] ) || $dispatch_state['date'] !== $today ) {
+        $dispatch_state = array(
+            'date'      => $today,
+            'processed' => array(),
+        );
+    }
+
+    $processed_slots = isset( $dispatch_state['processed'] ) && is_array( $dispatch_state['processed'] )
+        ? $dispatch_state['processed']
+        : array();
+
+    foreach ( $due_slots as $due_slot ) {
+        if ( in_array( $due_slot, $processed_slots, true ) ) {
+            continue;
+        }
+
+        /**
+         * minute実行が遅延しても、未処理スロットは必ず補填実行する。
+         */
+        do_action( JPF_CLOSE_CRON_HOOK, $due_slot );
+        $processed_slots[] = $due_slot;
+    }
+
+    $dispatch_state['processed'] = array_values( array_unique( $processed_slots ) );
+    update_option( JPF_CLOSE_DISPATCH_STATE_OPTION, $dispatch_state, false );
 }
 
 function jpf_is_valid_close_scheduled_time( $scheduled_time, DateTimeZone $timezone ) {
@@ -326,6 +379,22 @@ function jpf_run_track_usage_close_job( $scheduled_time = '' ) {
             'run_times'    => JPF_CLOSE_RUN_TIMES,
         ) );
         return;
+    }
+
+    if ( wp_doing_cron() ) {
+        $dispatch_state = get_option( JPF_CLOSE_DISPATCH_STATE_OPTION, array() );
+        $processed_slots = ( is_array( $dispatch_state ) && isset( $dispatch_state['processed'] ) && is_array( $dispatch_state['processed'] ) )
+            ? $dispatch_state['processed']
+            : array();
+
+        if ( in_array( (string) $scheduled_time, $processed_slots, true ) ) {
+            jpf_add_close_log( 'info', '同一スロットの重複Cron実行をスキップしました。', array(
+                'date'         => $today,
+                'current_time' => $now->format( 'H:i:s' ),
+                'scheduled_at' => (string) $scheduled_time,
+            ) );
+            return;
+        }
     }
 
     jpf_add_close_log( 'info', '締切自動化ジョブを開始しました。', array(
